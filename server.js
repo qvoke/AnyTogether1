@@ -114,6 +114,8 @@ function createRoom(roomId, title = null, ownerId = null) {
       time: 0,
       updatedAt: createdAt
     },
+    participants: [],
+    loadedFromDisk: false,
 
     // Playback sync properties:
     revision: 0,
@@ -127,6 +129,19 @@ function createRoom(roomId, title = null, ownerId = null) {
       actionId: null
     }
   };
+}
+
+function parsePersistedJson(raw, storeName) {
+  if (!String(raw || "").trim()) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    console.warn(`Failed to parse ${storeName}; starting with an empty store.`);
+    return null;
+  }
 }
 
 function getRoom(roomId) {
@@ -182,6 +197,8 @@ function getSocketState(socket) {
       socketId: crypto.randomUUID(),
       nickname: "Guest",
       role: "guest",
+      canManageContent: true,
+      hasExtension: false,
       clientId: null,
       userId: null,
       sessionToken: null,
@@ -345,6 +362,7 @@ function roomToPersistable(room) {
     playlist: room.playlist,
     currentMedia: room.currentMedia,
     currentPlayback: room.currentPlayback,
+    participants: Array.isArray(room.participants) ? room.participants : [],
     lastUpdatedAt: room.lastUpdatedAt
   };
 }
@@ -379,6 +397,8 @@ function normalizePersistedRoom(roomData) {
   room.sessionStartedAt = Number.isFinite(roomData?.sessionStartedAt) ? roomData.sessionStartedAt : room.createdAt;
   room.chat = Array.isArray(roomData?.chat) ? roomData.chat : [];
   room.playlist = Array.isArray(roomData?.playlist) ? roomData.playlist : [];
+  room.participants = Array.isArray(roomData?.participants) ? roomData.participants : [];
+  room.loadedFromDisk = true;
 
   if (roomData?.currentMedia && typeof roomData.currentMedia === "object") {
     room.currentMedia = {
@@ -416,7 +436,11 @@ function normalizePersistedRoom(roomData) {
 async function loadRoomsFromDisk() {
   try {
     const raw = await readFile(roomStorePath, "utf8");
-    const parsed = JSON.parse(raw);
+    const parsed = parsePersistedJson(raw, "rooms store");
+    if (!parsed) {
+      return;
+    }
+
     const storedRooms = parsed?.rooms || {};
 
     for (const roomData of Object.values(storedRooms)) {
@@ -483,7 +507,10 @@ function scheduleAuthPersist() {
 async function loadAuthFromDisk() {
   try {
     const raw = await readFile(authStorePath, "utf8");
-    const parsed = JSON.parse(raw);
+    const parsed = parsePersistedJson(raw, "auth store");
+    if (!parsed) {
+      return;
+    }
 
     const storedUsers = parsed?.users || {};
     for (const userData of Object.values(storedUsers)) {
@@ -542,6 +569,25 @@ function serializeUser(user) {
     lastLoginAt: user.lastLoginAt,
     roomCount: user.roomCodes.size
   };
+}
+
+function updateUserDisplayName(userId, displayName) {
+  const user = getUserById(userId);
+  const displayNameValue = normalizeDisplayName(displayName);
+  if (!user || !displayNameValue) return null;
+
+  const existingName = [...usersById.values()].some(
+    (entry) => entry.id !== user.id && entry.displayNameLower === displayNameValue.toLowerCase()
+  );
+  if (existingName) {
+    throw new Error("Display name already registered");
+  }
+
+  user.displayName = displayNameValue;
+  user.displayNameLower = displayNameValue.toLowerCase();
+  user.lastLoginAt = now();
+  scheduleAuthPersist();
+  return user;
 }
 
 function createSession(userId) {
@@ -695,22 +741,16 @@ function generateRoomCode() {
 }
 
 function buildParticipantList(roomCode) {
-  const members = [...getRoomMembers(roomCode)];
+  const room = rooms.get(roomCode);
+  if (!room) return [];
 
-  return members
-    .map((socket) => {
-      const state = socketState.get(socket);
-      if (!state) return null;
+  for (const socket of getRoomMembers(roomCode)) {
+    syncRoomParticipant(room, socket, { connected: true });
+  }
 
-      return {
-        socketId: state.socketId,
-        clientId: state.clientId,
-        nickname: state.nickname,
-        role: state.role,
-        joinedAt: state.joinedAtByRoom?.[roomCode] || null
-      };
-    })
-    .filter(Boolean);
+  const participants = Array.isArray(room.participants) ? room.participants.map((participant) => normalizeParticipantRecord(participant)).filter(Boolean) : [];
+  participants.sort(compareParticipantRecords);
+  return participants;
 }
 
 function buildRoomSnapshot(room) {
@@ -719,7 +759,7 @@ function buildRoomSnapshot(room) {
     title: room.title,
     createdAt: room.createdAt,
     sessionStartedAt: room.sessionStartedAt,
-    memberCount: getRoomMembers(room.code).size,
+    memberCount: Array.isArray(room.participants) ? room.participants.length : getRoomMembers(room.code).size,
     participants: buildParticipantList(room.code),
     chat: room.chat,
     playlist: room.playlist,
@@ -735,13 +775,146 @@ function buildRoomSummary(room) {
     title: room.title,
     createdAt: room.createdAt,
     sessionStartedAt: room.sessionStartedAt,
-    memberCount: getRoomMembers(room.code).size,
+    memberCount: Array.isArray(room.participants) ? room.participants.length : getRoomMembers(room.code).size,
     chatCount: room.chat.length,
     playlistCount: room.playlist.length,
     currentMediaTitle: room.currentMedia?.title || room.currentMedia?.seriesContext?.title || null,
     currentMediaUrl: room.currentMedia?.mediaUrl || null,
     lastUpdatedAt: room.lastUpdatedAt
   };
+}
+
+function normalizeParticipantRecord(participant, fallback = {}) {
+  if (!participant) return null;
+
+  const joinedAt = Number.isFinite(participant.joinedAt) ? participant.joinedAt : Number.isFinite(fallback.joinedAt) ? fallback.joinedAt : now();
+  const lastSeenAt = Number.isFinite(participant.lastSeenAt) ? participant.lastSeenAt : Number.isFinite(fallback.lastSeenAt) ? fallback.lastSeenAt : joinedAt;
+
+  return {
+    socketId: String(participant.socketId || fallback.socketId || "").trim() || null,
+    clientId: String(participant.clientId || fallback.clientId || "").trim() || null,
+    userId: String(participant.userId || fallback.userId || "").trim() || null,
+    nickname: normalizeNickname(participant.nickname || fallback.nickname || "Guest"),
+    role: normalizeRole(participant.role || fallback.role || "guest"),
+    canManageContent: participant.canManageContent !== false,
+    hasExtension: participant.hasExtension !== false,
+    connected: participant.connected !== false,
+    joinedAt,
+    lastSeenAt
+  };
+}
+
+function compareParticipantRecords(left, right) {
+  if (String(left.role || "guest") !== String(right.role || "guest")) {
+    return String(left.role || "guest") === "host" ? -1 : 1;
+  }
+
+  if (Boolean(left.connected) !== Boolean(right.connected)) {
+    return left.connected ? -1 : 1;
+  }
+
+  return (left.joinedAt || 0) - (right.joinedAt || 0);
+}
+
+function findParticipantRecord(room, state, socket = null) {
+  if (!room?.participants?.length) return null;
+
+  const clientId = state?.clientId ? String(state.clientId) : null;
+  const userId = state?.userId ? String(state.userId) : null;
+  const socketId = state?.socketId ? String(state.socketId) : null;
+  const fallbackClientId = socket?.context?.clientId ? String(socket.context.clientId) : null;
+
+  return room.participants.find((participant) => {
+    if (clientId && participant.clientId === clientId) return true;
+    if (userId && participant.userId === userId) return true;
+    if (socketId && participant.socketId === socketId) return true;
+    if (fallbackClientId && participant.clientId === fallbackClientId) return true;
+    return false;
+  }) || null;
+}
+
+function syncRoomParticipant(room, socket, { connected = true } = {}) {
+  if (!room || !socket) return null;
+
+  const state = getSocketState(socket);
+  const existing = findParticipantRecord(room, state, socket);
+  const nextRecord = normalizeParticipantRecord(
+    {
+      socketId: state.socketId,
+      clientId: state.clientId,
+      userId: state.userId,
+      nickname: state.nickname,
+      role: state.role,
+      canManageContent: state.canManageContent,
+      hasExtension: state.hasExtension,
+      connected,
+      joinedAt: existing?.joinedAt,
+      lastSeenAt: now()
+    },
+    existing || {}
+  );
+
+  room.participants = Array.isArray(room.participants)
+    ? room.participants.filter((participant) => {
+        if (!participant) return false;
+        if (nextRecord.clientId && participant.clientId === nextRecord.clientId) return false;
+        if (!nextRecord.clientId && nextRecord.userId && participant.userId === nextRecord.userId) return false;
+        if (!nextRecord.clientId && !nextRecord.userId && nextRecord.socketId && participant.socketId === nextRecord.socketId) return false;
+        return true;
+      })
+    : [];
+
+  room.participants.push(nextRecord);
+  room.participants.sort(compareParticipantRecords);
+  schedulePersist();
+  return nextRecord;
+}
+
+function markRoomParticipantDisconnected(room, socket) {
+  const state = getSocketState(socket);
+  const record = findParticipantRecord(room, state, socket);
+  if (!record) return;
+
+  record.connected = false;
+  record.socketId = null;
+  record.lastSeenAt = now();
+  schedulePersist();
+}
+
+function removeRoomParticipant(room, socket) {
+  if (!room || !Array.isArray(room.participants)) return;
+
+  const state = getSocketState(socket);
+  const clientId = state.clientId ? String(state.clientId) : null;
+  const userId = state.userId ? String(state.userId) : null;
+  const socketId = state.socketId ? String(state.socketId) : null;
+
+  room.participants = room.participants.filter((participant) => {
+    if (!participant) return false;
+    if (clientId && participant.clientId === clientId) return false;
+    if (!clientId && userId && participant.userId === userId) return false;
+    if (!clientId && !userId && socketId && participant.socketId === socketId) return false;
+    return true;
+  });
+  schedulePersist();
+}
+
+function deleteRoomIfOrphaned(roomCode) {
+  const normalized = normalizeRoomCode(roomCode);
+  if (!normalized) return false;
+
+  const room = rooms.get(normalized);
+  if (!room) return false;
+
+  if (room.clients.size > 0 || getRoomMembers(normalized).size > 0) {
+    return false;
+  }
+
+  rooms.delete(normalized);
+  roomMembers.delete(normalized);
+  schedulePersist();
+  broadcastRoomsList();
+  return true;
 }
 
 function assignNextHost(roomCode, excludedSocket = null) {
@@ -751,6 +924,11 @@ function assignNextHost(roomCode, excludedSocket = null) {
   const nextHost = members[0];
   const state = getSocketState(nextHost);
   state.role = "host";
+  const room = rooms.get(roomCode);
+  if (room) {
+    room.ownerId = state.userId ? String(state.userId) : null;
+    room.lastUpdatedAt = now();
+  }
 
   if (nextHost.readyState === 1) {
     nextHost.send(
@@ -776,8 +954,13 @@ function markRoomUpdated(roomCode, persist = true) {
   }
 }
 
+function normalizeRoomTitle(value) {
+  const title = String(value || "").trim().replace(/\s+/g, " ").slice(0, 60);
+  return title || null;
+}
+
 // WS joining/leaving for Connection 2 UI sockets
-function joinRoom(roomCode, socket, { nickname, role, clientId }) {
+function joinRoom(roomCode, socket, { nickname, clientId, canManageContent, hasExtension }) {
   const normalized = normalizeRoomCode(roomCode);
   if (!normalized) return;
 
@@ -786,13 +969,19 @@ function joinRoom(roomCode, socket, { nickname, role, clientId }) {
 
   state.clientId = clientId || state.clientId;
   state.nickname = nickname ? normalizeNickname(nickname) : state.nickname;
+  state.hasExtension = hasExtension !== false;
 
-  const firstMember = getRoomMembers(normalized).size === 0;
-  state.role = role ? normalizeRole(role) : firstMember ? "host" : "guest";
+  const hasMembers = getRoomMembers(normalized).size > 0 || (Array.isArray(room.participants) && room.participants.length > 0);
+  const isOwner = Boolean(state.userId && room.ownerId && String(room.ownerId) === String(state.userId));
+  const firstMember = !hasMembers;
+  state.role = isOwner || firstMember ? "host" : "guest";
+  state.canManageContent = canManageContent !== false && state.hasExtension !== false;
 
   getRoomMembers(normalized).add(socket);
   state.rooms.add(normalized);
   state.joinedAtByRoom[normalized] = now();
+  syncRoomParticipant(room, socket, { connected: true });
+  schedulePersist();
 
   sendJson(socket, {
     type: "room:snapshot",
@@ -818,14 +1007,29 @@ function leaveRoomFromUI(roomCode, socket) {
 
   const room = rooms.get(normalized);
   const state = getSocketState(socket);
+  const userId = state.userId;
 
   getRoomMembers(normalized).delete(socket);
   state.rooms.delete(normalized);
   delete state.joinedAtByRoom[normalized];
 
+  if (room) {
+    removeRoomParticipant(room, socket);
+  }
+
+  if (userId) {
+    detachRoomFromUser(userId, normalized);
+  }
+
+  schedulePersist();
+
   if (state.role === "host") {
     state.role = "guest";
     assignNextHost(normalized, socket);
+  }
+
+  if (deleteRoomIfOrphaned(normalized)) {
+    return;
   }
 
   broadcastRoomSnapshot(normalized);
@@ -837,6 +1041,27 @@ function leaveAllRooms(socket) {
   for (const roomCode of state.rooms) {
     leaveRoomFromUI(roomCode, socket);
   }
+}
+
+function detachSocketFromRooms(socket) {
+  const state = getSocketState(socket);
+
+  for (const roomCode of [...state.rooms]) {
+    const normalized = normalizeRoomCode(roomCode);
+    const room = rooms.get(normalized);
+    getRoomMembers(normalized).delete(socket);
+    delete state.joinedAtByRoom[normalized];
+    if (room) {
+      markRoomParticipantDisconnected(room, socket);
+      schedulePersist();
+      if (!deleteRoomIfOrphaned(normalized)) {
+        broadcastRoomSnapshot(normalized);
+        broadcastRoomsList();
+      }
+    }
+  }
+
+  state.rooms.clear();
 }
 
 // REST API Request handler
@@ -1051,6 +1276,35 @@ function applyPlayerIntent(room, context, message, nowVal) {
     };
   }
 
+  // Debounce sequential seeks from the same client: only update currentTime without bumping revision
+  if (action === "seek" && room.control.clientId === context.clientId) {
+    const seekInterval = nowVal - (room._lastSeekAt || 0);
+    if (seekInterval >= 0 && seekInterval < 300 && room.snapshot) {
+      const next = { ...room.snapshot };
+      if (typeof message.currentTime === "number" && Number.isFinite(message.currentTime)) {
+        next.currentTime = clampCurrentTime(message.currentTime);
+      }
+      if (typeof message.paused === "boolean") {
+        next.paused = message.paused;
+      }
+      next.updatedAt = nowVal;
+      next.lastAction = "seek";
+      next.lastActionId = actionId;
+      room.snapshot = next;
+      room._lastSeekAt = nowVal;
+      room.control.leaseUntil = nowVal + controlLeaseMs;
+      syncRoomPlaybackState(room);
+      broadcast(room, createRoomStatePayload(room), null);
+      schedulePersist();
+      return {
+        accepted: true,
+        actionId,
+        debounced: true
+      };
+    }
+  }
+  room._lastSeekAt = nowVal;
+
   if (
     room.control.clientId &&
     room.control.clientId !== context.clientId &&
@@ -1264,6 +1518,28 @@ wss.on("connection", (socket, request) => {
         broadcast(room, createPresencePayload(room));
         return;
       }
+
+      if (message.type === "media-request") {
+        // Forward quality/translation/episode request to all other clients in room
+        broadcast(room, {
+          type: "media-request",
+          roomId,
+          clientId: message.clientId,
+          requestedSeasonId: message.requestedSeasonId || null,
+          requestedEpisodeId: message.requestedEpisodeId || null,
+          requestedQualityLabel: message.requestedQualityLabel || null,
+          requestedTranslatorId: message.requestedTranslatorId || null
+        }, socket);
+
+        sendJson(socket, {
+          type: "player-ack",
+          roomId,
+          actionId: crypto.randomUUID(),
+          revision: room.revision,
+          control: serializeControl(room)
+        });
+        return;
+      }
     });
 
     socket.on("close", () => {
@@ -1281,11 +1557,7 @@ wss.on("connection", (socket, request) => {
 
       broadcastRoomSnapshot(room.roomId);
 
-      if (room.clients.size === 0 && getRoomMembers(roomId).size === 0) {
-        // Only delete the room if BOTH connection groups are empty
-        rooms.delete(roomId);
-        roomMembers.delete(roomId);
-        schedulePersist();
+      if (deleteRoomIfOrphaned(roomId)) {
         return;
       }
 
@@ -1339,16 +1611,32 @@ wss.on("connection", (socket, request) => {
           type: "auth:accepted",
           user: serializeUser(user)
         });
+
+        for (const roomId of state.rooms) {
+          attachRoomToUser(user.id, roomId);
+          const room = rooms.get(roomId);
+          if (room) {
+            syncRoomParticipant(room, socket, { connected: true });
+          }
+        }
+        for (const roomId of state.rooms) {
+          broadcastRoomSnapshot(roomId);
+        }
+        broadcastRoomsList();
         return;
       }
 
       if (message.type === "room:join") {
         const roomId = normalizeRoomCode(message.roomId);
         if (!roomId) return;
+        if (state.userId) {
+          attachRoomToUser(state.userId, roomId);
+        }
         joinRoom(roomId, socket, {
           nickname: message.nickname,
-          role: message.role,
-          clientId: message.clientId
+          clientId: message.clientId,
+          canManageContent: message.canManageContent,
+          hasExtension: message.hasExtension
         });
         return;
       }
@@ -1364,10 +1652,148 @@ wss.on("connection", (socket, request) => {
         const roomId = normalizeRoomCode(message.roomId);
         if (!roomId) return;
 
-        state.nickname = message.nickname ? normalizeNickname(message.nickname) : state.nickname;
-        state.role = message.role ? normalizeRole(message.role) : state.role;
+        const previousNickname = state.nickname;
+        const nextNickname = message.nickname ? normalizeNickname(message.nickname) : state.nickname;
+        state.canManageContent = message.canManageContent !== false;
+        state.hasExtension = message.hasExtension !== false;
         state.clientId = message.clientId || state.clientId;
 
+        if (state.userId && nextNickname) {
+          try {
+            updateUserDisplayName(state.userId, nextNickname);
+          } catch (error) {
+            state.nickname = previousNickname;
+            sendJson(socket, {
+              type: "room:profile-rejected",
+              roomId,
+              reason: error.message || "Unable to update display name"
+            });
+            return;
+          }
+        }
+
+        state.nickname = nextNickname;
+
+        for (const joinedRoomId of state.rooms) {
+          const room = rooms.get(joinedRoomId);
+          if (room) {
+            syncRoomParticipant(room, socket, { connected: true });
+          }
+          broadcastRoomSnapshot(joinedRoomId);
+        }
+        broadcastRoomsList();
+        return;
+      }
+
+      if (message.type === "room:participant-action") {
+        const roomId = normalizeRoomCode(message.roomId);
+        const targetClientId = String(message.targetClientId || "").trim();
+        const action = String(message.action || "").trim();
+        if (!roomId || !targetClientId || !action) return;
+
+        const room = rooms.get(roomId);
+        if (!room) return;
+
+        if (state.role !== "host" && (!room.ownerId || String(room.ownerId) !== String(state.userId))) {
+          sendJson(socket, {
+            type: "room:participant-action-rejected",
+            roomId,
+            reason: "Only the creator can manage participants"
+          });
+          return;
+        }
+
+        const targetSocket = [...getRoomMembers(roomId)].find((candidate) => getSocketState(candidate).clientId === targetClientId);
+        if (!targetSocket) return;
+
+        const targetState = getSocketState(targetSocket);
+
+        if (action === "kick") {
+          leaveRoomFromUI(roomId, targetSocket);
+          return;
+        }
+
+        if (action === "toggle-content") {
+          if (targetState.hasExtension === false) {
+            sendJson(socket, {
+              type: "room:participant-action-rejected",
+              roomId,
+              action,
+              reason: "Participant requires the extension"
+            });
+            return;
+          }
+
+          targetState.canManageContent = !targetState.canManageContent;
+          syncRoomParticipant(room, targetSocket, { connected: true });
+          broadcastRoomSnapshot(roomId);
+          broadcastRoomsList();
+          return;
+        }
+
+        if (action === "make-creator") {
+          for (const member of getRoomMembers(roomId)) {
+            const memberState = getSocketState(member);
+            memberState.role = "guest";
+          }
+
+          targetState.role = "host";
+          if (targetState.userId) {
+            room.ownerId = targetState.userId;
+            attachRoomToUser(targetState.userId, roomId);
+          } else {
+            room.ownerId = null;
+          }
+
+          syncRoomParticipant(room, targetSocket, { connected: true });
+
+          if (socket.readyState === 1) {
+            socket.send(
+              JSON.stringify({
+                type: "room:role",
+                roomId,
+                role: "guest"
+              })
+            );
+          }
+
+          if (targetSocket.readyState === 1) {
+            targetSocket.send(
+              JSON.stringify({
+                type: "room:role",
+                roomId,
+                role: "host"
+              })
+            );
+          }
+
+          broadcastRoomSnapshot(roomId);
+          broadcastRoomsList();
+          return;
+        }
+      }
+
+      if (message.type === "room:rename") {
+        const roomId = normalizeRoomCode(message.roomId);
+        if (!roomId) return;
+
+        const room = rooms.get(roomId);
+        if (!room) return;
+
+        if (state.role !== "host" && room.ownerId !== state.userId) {
+          sendJson(socket, {
+            type: "room:rename-rejected",
+            roomId,
+            reason: "Only the creator can rename a room"
+          });
+          return;
+        }
+
+        const nextTitle = normalizeRoomTitle(message.title);
+        if (!nextTitle) return;
+
+        room.title = nextTitle;
+        markRoomUpdated(roomId);
         broadcastRoomSnapshot(roomId);
         broadcastRoomsList();
         return;
@@ -1492,12 +1918,13 @@ wss.on("connection", (socket, request) => {
         const roomId = normalizeRoomCode(message.roomId);
         const room = rooms.get(roomId);
         if (!room) return;
+        const nextSeriesContext = message.seriesContext || room.currentMedia?.seriesContext || null;
 
         room.currentMedia = {
           mediaUrl: String(message.mediaUrl || ""),
           pageUrl: message.pageUrl || null,
           title: message.title || null,
-          seriesContext: message.seriesContext || null,
+          seriesContext: nextSeriesContext,
           updatedAt: now()
         };
 
@@ -1519,9 +1946,16 @@ wss.on("connection", (socket, request) => {
     });
 
     socket.on("close", () => {
-      leaveAllRooms(socket);
+      detachSocketFromRooms(socket);
       connectedSockets.delete(socket);
       socketState.delete(socket);
+      for (const roomCode of [...rooms.keys()]) {
+        const room = rooms.get(roomCode);
+        if (room && room.clients.size === 0 && (!room.participants || room.participants.length === 0)) {
+          rooms.delete(roomCode);
+          roomMembers.delete(roomCode);
+        }
+      }
       broadcastRoomsList();
     });
   }
