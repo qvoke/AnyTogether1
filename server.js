@@ -1353,6 +1353,16 @@ function clampCurrentTime(value) {
   return Math.max(0, value);
 }
 
+function setPendingTimelineCommand(room, context, actionId, snapshot, updatedAt) {
+  room.pendingSeekCommand = {
+    actionId,
+    currentTime: snapshot.currentTime,
+    paused: snapshot.paused,
+    originClientId: context.clientId,
+    updatedAt
+  };
+}
+
 function applyPlayerIntent(room, context, message, nowVal) {
   const action = typeof message.action === "string" ? message.action : "";
   const actionId = typeof message.actionId === "string" && message.actionId ? message.actionId : crypto.randomUUID();
@@ -1383,13 +1393,7 @@ function applyPlayerIntent(room, context, message, nowVal) {
       room.snapshot = next;
       room.lastSeekClientId = context.clientId;
       room.lastSeekAt = nowVal;
-      room.pendingSeekCommand = {
-        actionId,
-        currentTime: next.currentTime,
-        paused: next.paused,
-        originClientId: context.clientId,
-        updatedAt: nowVal
-      };
+      setPendingTimelineCommand(room, context, actionId, next, nowVal);
       context.playbackStatus = {
         clientId: context.clientId,
         currentTime: next.currentTime,
@@ -1431,6 +1435,10 @@ function applyPlayerIntent(room, context, message, nowVal) {
   };
 
   if (action === "load") {
+    room.pendingSeekCommand = null;
+    room.lastSeekClientId = null;
+    room.lastSeekAt = 0;
+
     if (typeof message.mediaUrl === "string" && message.mediaUrl.trim()) {
       next.mediaUrl = message.mediaUrl.trim();
     }
@@ -1472,27 +1480,18 @@ function applyPlayerIntent(room, context, message, nowVal) {
     next.paused = true;
   }
 
-  if ((action === "play" || action === "pause") && room.pendingSeekCommand) {
-    room.pendingSeekCommand = {
-      ...room.pendingSeekCommand,
-      actionId,
-      currentTime: next.currentTime,
-      paused: next.paused,
-      originClientId: context.clientId,
-      updatedAt: nowVal
-    };
+  if (action === "play" || action === "pause") {
+    room.lastSeekClientId = null;
+    room.lastSeekAt = 0;
   }
 
   if (action === "seek") {
     room.lastSeekClientId = context.clientId;
     room.lastSeekAt = nowVal;
-    room.pendingSeekCommand = {
-      actionId,
-      currentTime: next.currentTime,
-      paused: next.paused,
-      originClientId: context.clientId,
-      updatedAt: nowVal
-    };
+  }
+
+  if (["seek", "play", "pause"].includes(action)) {
+    setPendingTimelineCommand(room, context, actionId, next, nowVal);
   }
 
   context.playbackStatus = {
