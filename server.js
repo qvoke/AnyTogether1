@@ -500,7 +500,16 @@ function normalizePersistedRoom(roomData) {
   room.sessionStartedAt = Number.isFinite(roomData?.sessionStartedAt) ? roomData.sessionStartedAt : room.createdAt;
   room.chat = Array.isArray(roomData?.chat) ? roomData.chat : [];
   room.playlist = Array.isArray(roomData?.playlist) ? roomData.playlist : [];
-  room.participants = Array.isArray(roomData?.participants) ? roomData.participants : [];
+  room.participants = Array.isArray(roomData?.participants)
+    ? roomData.participants
+        .map((participant) => normalizeParticipantRecord(participant))
+        .filter(Boolean)
+        .map((participant) => ({
+          ...participant,
+          connected: false,
+          socketId: null
+        }))
+    : [];
   room.loadedFromDisk = true;
 
   if (roomData?.currentMedia && typeof roomData.currentMedia === "object") {
@@ -850,13 +859,14 @@ function buildParticipantList(roomCode) {
 }
 
 function buildRoomSnapshot(room) {
+  const participants = buildParticipantList(room.code);
   return {
     code: room.code,
     title: room.title,
     createdAt: room.createdAt,
     sessionStartedAt: room.sessionStartedAt,
-    memberCount: Array.isArray(room.participants) ? room.participants.length : getRoomMembers(room.code).size,
-    participants: buildParticipantList(room.code),
+    memberCount: participants.filter((participant) => participant.connected !== false).length,
+    participants,
     chat: room.chat,
     playlist: room.playlist,
     currentMedia: room.currentMedia,
@@ -866,12 +876,13 @@ function buildRoomSnapshot(room) {
 }
 
 function buildRoomSummary(room) {
+  const participants = buildParticipantList(room.code);
   return {
     code: room.code,
     title: room.title,
     createdAt: room.createdAt,
     sessionStartedAt: room.sessionStartedAt,
-    memberCount: Array.isArray(room.participants) ? room.participants.length : getRoomMembers(room.code).size,
+    memberCount: participants.filter((participant) => participant.connected !== false).length,
     chatCount: room.chat.length,
     playlistCount: room.playlist.length,
     currentMediaTitle: room.currentMedia?.title || room.currentMedia?.seriesContext?.title || null,
@@ -954,7 +965,7 @@ function syncRoomParticipant(room, socket, { connected = true } = {}) {
     ? room.participants.filter((participant) => {
         if (!participant) return false;
         if (nextRecord.clientId && participant.clientId === nextRecord.clientId) return false;
-        if (!nextRecord.clientId && nextRecord.userId && participant.userId === nextRecord.userId) return false;
+        if (nextRecord.userId && participant.userId === nextRecord.userId) return false;
         if (!nextRecord.clientId && !nextRecord.userId && nextRecord.socketId && participant.socketId === nextRecord.socketId) return false;
         return true;
       })
@@ -1645,6 +1656,9 @@ wss.on("connection", (socket, request) => {
             type: "player-intent-rejected",
             roomId,
             actionId: result.actionId,
+            action: message.action,
+            currentTime: message.currentTime,
+            paused: message.paused,
             reason: result.reason,
             revision: room.revision,
             control: serializeControl(room),
