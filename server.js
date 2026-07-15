@@ -10,6 +10,13 @@ const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
 const port = 3000;
 const controlLeaseMs = 1200;
+const playbackStatusMaxAgeMs = 2500;
+const playbackSyncToleranceMs = 100;
+const playbackSyncDisplayStepMs = 50;
+const playbackSyncActionWindowMs = 1500;
+const playbackSeekRecoveryWindowMs = 15000;
+const seekCommandInitialGraceMs = 700;
+const seekCommandRetryMs = 800;
 
 // Disk persistence variables
 const dataDir = path.join(__dirname, "data");
@@ -261,6 +268,115 @@ function createPresencePayload(room) {
       role: client.context.role
     }))
   };
+}
+
+function projectPlaybackStatus(status, timestamp) {
+  if (!status || timestamp - status.receivedAt > playbackStatusMaxAgeMs) return null;
+
+  const elapsedSeconds = status.paused || status.buffering
+    ? 0
+    : Math.max(0, timestamp - status.receivedAt) / 1000;
+  return {
+    clientId: status.clientId,
+    currentTime: Math.max(0, status.currentTime + elapsedSeconds),
+    paused: status.paused,
+    buffering: status.buffering,
+    applyingSeek: status.applyingSeek
+  };
+}
+
+function createPlaybackSyncPayload(room) {
+  const timestamp = now();
+  const statuses = Array.from(room.clients)
+    .map((client) => projectPlaybackStatus(client.context.playbackStatus, timestamp))
+    .filter(Boolean);
+
+  const seekCommand = createSeekCommandPayload(room, timestamp);
+  let referenceClientId = seekCommand?.originClientId || null;
+  let referenceTime = seekCommand?.currentTime ?? null;
+  if (referenceTime === null && statuses.length > 0) {
+    const reference = statuses.reduce((latest, status) =>
+      status.currentTime > latest.currentTime ? status : latest
+    );
+    referenceClientId = reference.clientId;
+    referenceTime = reference.currentTime;
+  }
+
+  referenceTime ??= 0;
+  const lastAction = room.snapshot?.lastAction;
+  const lastActionAt = Number(room.snapshot?.updatedAt) || 0;
+  const actionSyncActive = (lastAction === "seek" || lastAction === "pause") &&
+    timestamp - lastActionAt <= playbackSyncActionWindowMs;
+  return {
+    type: "playback-sync",
+    roomId: room.roomId,
+    referenceClientId,
+    offsets: statuses.map((status) => {
+      const rawAdjustmentMs = Math.round((referenceTime - status.currentTime) * 1000);
+      const rawOffsetMs = Math.abs(rawAdjustmentMs);
+      const offsetMs = rawOffsetMs <= playbackSyncToleranceMs
+        ? 0
+        : Math.round(rawOffsetMs / playbackSyncDisplayStepMs) * playbackSyncDisplayStepMs;
+      const adjustmentMs = rawOffsetMs <= playbackSyncToleranceMs
+        ? 0
+        : Math.sign(rawAdjustmentMs) * offsetMs;
+      const seekRecoveryActive = Boolean(room.lastSeekAt) &&
+        timestamp - room.lastSeekAt <= playbackSeekRecoveryWindowMs &&
+        rawOffsetMs > playbackSyncToleranceMs;
+      const reason = status.buffering
+        ? "buffering"
+        : seekRecoveryActive || lastAction === "seek" && actionSyncActive
+          ? "seek"
+          : lastAction === "pause" && actionSyncActive
+            ? "pause"
+            : null;
+      return {
+        clientId: status.clientId,
+        offsetMs,
+        adjustmentMs,
+        buffering: status.buffering,
+        active: Boolean(reason),
+        reason
+      };
+    })
+  };
+}
+
+function broadcastPlaybackSync(room) {
+  broadcast(room, createPlaybackSyncPayload(room));
+}
+
+function createSeekCommandPayload(room, timestamp = now()) {
+  const command = room.pendingSeekCommand;
+  if (!command || timestamp - command.updatedAt > playbackSeekRecoveryWindowMs) return null;
+
+  const elapsedSeconds = command.paused ? 0 : Math.max(0, timestamp - command.updatedAt) / 1000;
+  return {
+    type: "seek-command",
+    roomId: room.roomId,
+    actionId: command.actionId,
+    currentTime: command.currentTime + elapsedSeconds,
+    paused: command.paused,
+    originClientId: command.originClientId
+  };
+}
+
+function retryPendingSeekForClient(room, socket, status, timestamp) {
+  const command = createSeekCommandPayload(room, timestamp);
+  if (!command || command.originClientId === socket.context.clientId) return;
+  if (status.buffering || status.applyingSeek) return;
+  if (timestamp - room.pendingSeekCommand.updatedAt < seekCommandInitialGraceMs) return;
+  if (Math.abs(command.currentTime - status.currentTime) <= 0.3) return;
+  if (
+    socket.context.lastSeekCommandActionId === command.actionId &&
+    timestamp - (socket.context.lastSeekCommandAt || 0) < seekCommandRetryMs
+  ) {
+    return;
+  }
+
+  socket.context.lastSeekCommandActionId = command.actionId;
+  socket.context.lastSeekCommandAt = timestamp;
+  sendJson(socket, command);
 }
 
 // Synced bridges
@@ -943,9 +1059,11 @@ function joinRoom(roomCode, socket, { nickname, clientId, canManageContent, hasE
   state.nickname = nickname ? normalizeNickname(nickname) : state.nickname;
   state.hasExtension = hasExtension !== false;
 
+  const existingParticipant = findParticipantRecord(room, state, socket);
   const isOwner = Boolean(state.userId && room.ownerId && String(room.ownerId) === String(state.userId));
   const firstMember = !room.loadedFromDisk && getRoomMembers(normalized).size === 0 && (!Array.isArray(room.participants) || room.participants.length === 0);
-  state.role = isOwner || firstMember ? "host" : "guest";
+  const isReturningAnonymousOwner = String(existingParticipant?.role || "guest") === "host";
+  state.role = isOwner || firstMember || isReturningAnonymousOwner ? "host" : "guest";
   state.canManageContent = canManageContent !== false && state.hasExtension !== false;
 
   getRoomMembers(normalized).add(socket);
@@ -1247,7 +1365,6 @@ function applyPlayerIntent(room, context, message, nowVal) {
     };
   }
 
-  // Debounce sequential seeks from the same client: only update currentTime without bumping revision
   if (action === "seek" && room.control.clientId === context.clientId) {
     const seekInterval = nowVal - (room._lastSeekAt || 0);
     if (seekInterval >= 0 && seekInterval < 300 && room.snapshot) {
@@ -1258,10 +1375,28 @@ function applyPlayerIntent(room, context, message, nowVal) {
       if (typeof message.paused === "boolean") {
         next.paused = message.paused;
       }
+      room.revision += 1;
+      next.revision = room.revision;
       next.updatedAt = nowVal;
       next.lastAction = "seek";
       next.lastActionId = actionId;
       room.snapshot = next;
+      room.lastSeekClientId = context.clientId;
+      room.lastSeekAt = nowVal;
+      room.pendingSeekCommand = {
+        actionId,
+        currentTime: next.currentTime,
+        paused: next.paused,
+        originClientId: context.clientId,
+        updatedAt: nowVal
+      };
+      context.playbackStatus = {
+        clientId: context.clientId,
+        currentTime: next.currentTime,
+        paused: next.paused,
+        buffering: false,
+        receivedAt: nowVal
+      };
       room._lastSeekAt = nowVal;
       room.control.leaseUntil = nowVal + controlLeaseMs;
       syncRoomPlaybackState(room);
@@ -1279,7 +1414,9 @@ function applyPlayerIntent(room, context, message, nowVal) {
   if (
     room.control.clientId &&
     room.control.clientId !== context.clientId &&
-    room.control.leaseUntil > nowVal
+    room.control.leaseUntil > nowVal &&
+    action !== "play" &&
+    action !== "pause"
   ) {
     return {
       accepted: false,
@@ -1334,6 +1471,37 @@ function applyPlayerIntent(room, context, message, nowVal) {
   if (action === "pause") {
     next.paused = true;
   }
+
+  if ((action === "play" || action === "pause") && room.pendingSeekCommand) {
+    room.pendingSeekCommand = {
+      ...room.pendingSeekCommand,
+      actionId,
+      currentTime: next.currentTime,
+      paused: next.paused,
+      originClientId: context.clientId,
+      updatedAt: nowVal
+    };
+  }
+
+  if (action === "seek") {
+    room.lastSeekClientId = context.clientId;
+    room.lastSeekAt = nowVal;
+    room.pendingSeekCommand = {
+      actionId,
+      currentTime: next.currentTime,
+      paused: next.paused,
+      originClientId: context.clientId,
+      updatedAt: nowVal
+    };
+  }
+
+  context.playbackStatus = {
+    clientId: context.clientId,
+    currentTime: next.currentTime,
+    paused: next.paused,
+    buffering: false,
+    receivedAt: nowVal
+  };
 
   room.control = {
     clientId: context.clientId,
@@ -1451,6 +1619,22 @@ wss.on("connection", (socket, request) => {
 
       if (message.type === "request-sync") {
         sendJson(socket, createRoomStatePayload(room));
+        sendJson(socket, createPlaybackSyncPayload(room));
+        return;
+      }
+
+      if (message.type === "playback-status") {
+        const statusTimestamp = now();
+        socket.context.playbackStatus = {
+          clientId: socket.context.clientId,
+          currentTime: clampCurrentTime(message.currentTime),
+          paused: Boolean(message.paused),
+          buffering: Boolean(message.buffering),
+          applyingSeek: Boolean(message.applyingSeek),
+          receivedAt: statusTimestamp
+        };
+        retryPendingSeekForClient(room, socket, socket.context.playbackStatus, statusTimestamp);
+        broadcastPlaybackSync(room);
         return;
       }
 
@@ -1487,6 +1671,7 @@ wss.on("connection", (socket, request) => {
         });
 
         broadcast(room, createPresencePayload(room));
+        broadcastPlaybackSync(room);
         return;
       }
 
@@ -1526,6 +1711,11 @@ wss.on("connection", (socket, request) => {
         };
       }
 
+      if (room.lastSeekClientId === socket.context.clientId) {
+        room.lastSeekClientId = null;
+        room.lastSeekAt = 0;
+      }
+
       broadcastRoomSnapshot(room.roomId);
 
       if (deleteRoomIfOrphaned(roomId)) {
@@ -1533,6 +1723,7 @@ wss.on("connection", (socket, request) => {
       }
 
       broadcast(room, createPresencePayload(room));
+      broadcastPlaybackSync(room);
     });
 
   } else {
