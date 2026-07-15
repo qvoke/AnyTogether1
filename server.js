@@ -101,7 +101,7 @@ function createRoom(roomId, title = null, ownerId = null) {
   return {
     roomId: code,
     code,
-    title: title || `Room ${code}`,
+    title: title || "Room",
     ownerId: ownerId ? String(ownerId) : null,
     createdAt,
     sessionStartedAt: createdAt,
@@ -129,19 +129,6 @@ function createRoom(roomId, title = null, ownerId = null) {
       actionId: null
     }
   };
-}
-
-function parsePersistedJson(raw, storeName) {
-  if (!String(raw || "").trim()) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(raw);
-  } catch (error) {
-    console.warn(`Failed to parse ${storeName}; starting with an empty store.`);
-    return null;
-  }
 }
 
 function getRoom(roomId) {
@@ -436,11 +423,7 @@ function normalizePersistedRoom(roomData) {
 async function loadRoomsFromDisk() {
   try {
     const raw = await readFile(roomStorePath, "utf8");
-    const parsed = parsePersistedJson(raw, "rooms store");
-    if (!parsed) {
-      return;
-    }
-
+    const parsed = JSON.parse(raw);
     const storedRooms = parsed?.rooms || {};
 
     for (const roomData of Object.values(storedRooms)) {
@@ -507,10 +490,7 @@ function scheduleAuthPersist() {
 async function loadAuthFromDisk() {
   try {
     const raw = await readFile(authStorePath, "utf8");
-    const parsed = parsePersistedJson(raw, "auth store");
-    if (!parsed) {
-      return;
-    }
+    const parsed = JSON.parse(raw);
 
     const storedUsers = parsed?.users || {};
     for (const userData of Object.values(storedUsers)) {
@@ -906,15 +886,7 @@ function deleteRoomIfOrphaned(roomCode) {
   const room = rooms.get(normalized);
   if (!room) return false;
 
-  if (room.clients.size > 0 || getRoomMembers(normalized).size > 0) {
-    return false;
-  }
-
-  rooms.delete(normalized);
-  roomMembers.delete(normalized);
-  schedulePersist();
-  broadcastRoomsList();
-  return true;
+  return false;
 }
 
 function assignNextHost(roomCode, excludedSocket = null) {
@@ -971,9 +943,8 @@ function joinRoom(roomCode, socket, { nickname, clientId, canManageContent, hasE
   state.nickname = nickname ? normalizeNickname(nickname) : state.nickname;
   state.hasExtension = hasExtension !== false;
 
-  const hasMembers = getRoomMembers(normalized).size > 0 || (Array.isArray(room.participants) && room.participants.length > 0);
   const isOwner = Boolean(state.userId && room.ownerId && String(room.ownerId) === String(state.userId));
-  const firstMember = !hasMembers;
+  const firstMember = !room.loadedFromDisk && getRoomMembers(normalized).size === 0 && (!Array.isArray(room.participants) || room.participants.length === 0);
   state.role = isOwner || firstMember ? "host" : "guest";
   state.canManageContent = canManageContent !== false && state.hasExtension !== false;
 
@@ -1197,7 +1168,7 @@ async function handleApiRequest(request, response, url) {
     }
 
     const user = getUserFromRequest(request);
-    if (room.ownerId && (!user || room.ownerId !== user.id)) {
+    if (room.ownerId && (!user || String(room.ownerId) !== String(user.id))) {
       sendJson(response, 403, { error: "Forbidden: You are not the owner of this room" });
       return true;
     }
@@ -1780,7 +1751,7 @@ wss.on("connection", (socket, request) => {
         const room = rooms.get(roomId);
         if (!room) return;
 
-        if (state.role !== "host" && room.ownerId !== state.userId) {
+        if (state.role !== "host" && String(room.ownerId || "") !== String(state.userId || "")) {
           sendJson(socket, {
             type: "room:rename-rejected",
             roomId,
