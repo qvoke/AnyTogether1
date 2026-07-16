@@ -265,7 +265,13 @@ function createPresencePayload(room) {
     members: Array.from(room.clients).map((client) => ({
       clientId: client.context.clientId,
       name: client.context.name,
-      role: client.context.role
+      role: client.context.role,
+      playbackState: client.context.playbackStatus
+        ? client.context.playbackStatus.buffering
+          || client.context.playbackStatus.applyingSeek
+          ? "loading"
+          : client.context.playbackStatus.paused ? "paused" : "playing"
+        : "loading"
     }))
   };
 }
@@ -1644,6 +1650,7 @@ wss.on("connection", (socket, request) => {
           receivedAt: statusTimestamp
         };
         retryPendingSeekForClient(room, socket, socket.context.playbackStatus, statusTimestamp);
+        broadcast(room, createPresencePayload(room));
         broadcastPlaybackSync(room);
         return;
       }
