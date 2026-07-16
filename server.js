@@ -513,6 +513,7 @@ function normalizePersistedRoom(roomData) {
         .map((participant) => ({
           ...participant,
           connected: false,
+          presenceStatus: "offline",
           socketId: null
         }))
     : [];
@@ -902,6 +903,9 @@ function normalizeParticipantRecord(participant, fallback = {}) {
 
   const joinedAt = Number.isFinite(participant.joinedAt) ? participant.joinedAt : Number.isFinite(fallback.joinedAt) ? fallback.joinedAt : now();
   const lastSeenAt = Number.isFinite(participant.lastSeenAt) ? participant.lastSeenAt : Number.isFinite(fallback.lastSeenAt) ? fallback.lastSeenAt : joinedAt;
+  const presenceStatus = ["online", "offline", "not-in-room"].includes(participant.presenceStatus)
+    ? participant.presenceStatus
+    : participant.connected === false ? "offline" : "online";
 
   return {
     socketId: String(participant.socketId || fallback.socketId || "").trim() || null,
@@ -911,7 +915,8 @@ function normalizeParticipantRecord(participant, fallback = {}) {
     role: normalizeRole(participant.role || fallback.role || "guest"),
     canManageContent: participant.canManageContent !== false,
     hasExtension: participant.hasExtension !== false,
-    connected: participant.connected !== false,
+    connected: presenceStatus === "online",
+    presenceStatus,
     joinedAt,
     lastSeenAt
   };
@@ -961,6 +966,7 @@ function syncRoomParticipant(room, socket, { connected = true } = {}) {
       canManageContent: state.canManageContent,
       hasExtension: state.hasExtension,
       connected,
+      presenceStatus: connected ? "online" : "offline",
       joinedAt: existing?.joinedAt,
       lastSeenAt: now()
     },
@@ -989,6 +995,19 @@ function markRoomParticipantDisconnected(room, socket) {
   if (!record) return;
 
   record.connected = false;
+  record.presenceStatus = "offline";
+  record.socketId = null;
+  record.lastSeenAt = now();
+  schedulePersist();
+}
+
+function markRoomParticipantNotInRoom(room, socket) {
+  const state = getSocketState(socket);
+  const record = findParticipantRecord(room, state, socket);
+  if (!record) return;
+
+  record.connected = false;
+  record.presenceStatus = "not-in-room";
   record.socketId = null;
   record.lastSeenAt = now();
   schedulePersist();
@@ -1120,7 +1139,7 @@ function leaveRoomFromUI(roomCode, socket) {
   delete state.joinedAtByRoom[normalized];
 
   if (room) {
-    removeRoomParticipant(room, socket);
+    markRoomParticipantNotInRoom(room, socket);
   }
 
   if (userId) {
