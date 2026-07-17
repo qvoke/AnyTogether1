@@ -1204,7 +1204,11 @@ function leaveRoomFromUI(roomCode, socket, { keepNotInRoom = false } = {}) {
   delete state.joinedAtByRoom[normalized];
 
   if (room) {
-    markRoomParticipantNotInRoom(room, socket);
+    if (keepNotInRoom) {
+      markRoomParticipantNotInRoom(room, socket);
+    } else {
+      removeRoomParticipant(room, socket);
+    }
   }
 
   if (userId) {
