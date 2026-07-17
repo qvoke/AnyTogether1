@@ -1713,13 +1713,15 @@ wss.on("connection", (socket, request) => {
     const role = roleQuery || "guest";
     const name = url.searchParams.get("name") || "Guest";
     const clientId = url.searchParams.get("clientId") || crypto.randomUUID();
+    const hasExtension = url.searchParams.get("hasExtension") === "true";
     const room = getRoom(roomId);
 
     socket.context = {
       clientId,
       name,
       roomId,
-      role
+      role,
+      hasExtension
     };
 
     room.clients.add(socket);
@@ -1749,7 +1751,8 @@ wss.on("connection", (socket, request) => {
         socket.context = {
           ...socket.context,
           name: typeof message.name === "string" ? message.name : socket.context.name,
-          role: typeof message.role === "string" ? message.role : socket.context.role
+          role: typeof message.role === "string" ? message.role : socket.context.role,
+          hasExtension: message.hasExtension === true
         };
 
         refreshRoomSnapshotFromPlayback(room);
@@ -1823,7 +1826,7 @@ wss.on("connection", (socket, request) => {
       }
 
       if (message.type === "media-request") {
-        broadcast(room, {
+        const requestPayload = {
           type: "media-request",
           roomId,
           clientId: message.clientId,
@@ -1832,7 +1835,19 @@ wss.on("connection", (socket, request) => {
           requestedQualityLabel: message.requestedQualityLabel || null,
           requestedTranslatorId: message.requestedTranslatorId || null,
           requestToken: message.requestToken || null
-        }, socket);
+        };
+        const resolverCandidates = Array.from(room.clients).filter((client) =>
+          client !== socket &&
+          client.readyState === 1 &&
+          client.context?.hasExtension === true
+        );
+        const resolverSocket = resolverCandidates.find((client) => client.context?.role === "host") || resolverCandidates[0];
+
+        if (resolverSocket) {
+          sendJson(resolverSocket, requestPayload);
+        } else {
+          broadcast(room, requestPayload, socket);
+        }
 
         sendJson(socket, {
           type: "player-ack",
