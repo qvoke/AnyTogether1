@@ -298,6 +298,32 @@ function projectPlaybackStatus(status, timestamp) {
   };
 }
 
+function refreshRoomSnapshotFromPlayback(room, timestamp = now()) {
+  if (!room.snapshot?.mediaUrl) return false;
+
+  const candidates = Array.from(room.clients)
+    .map((client) => client.context?.playbackStatus)
+    .filter((status) => projectPlaybackStatus(status, timestamp));
+  if (!candidates.length) return false;
+
+  const controlledStatus = room.control.clientId
+    ? candidates.find((status) => status.clientId === room.control.clientId)
+    : null;
+  const status = controlledStatus || candidates.sort((left, right) => right.receivedAt - left.receivedAt)[0];
+  const projected = projectPlaybackStatus(status, timestamp);
+  if (!projected) return false;
+
+  room.snapshot.currentTime = projected.currentTime;
+  room.snapshot.paused = projected.paused;
+  room.snapshot.updatedAt = timestamp;
+  room.currentPlayback = {
+    state: projected.paused ? "paused" : "playing",
+    time: projected.currentTime,
+    updatedAt: timestamp
+  };
+  return true;
+}
+
 function createPlaybackSyncPayload(room) {
   const timestamp = now();
   const statuses = Array.from(room.clients)
@@ -1695,6 +1721,7 @@ wss.on("connection", (socket, request) => {
     };
 
     room.clients.add(socket);
+    refreshRoomSnapshotFromPlayback(room);
 
     sendJson(socket, {
       type: "connected",
@@ -1723,12 +1750,14 @@ wss.on("connection", (socket, request) => {
           role: typeof message.role === "string" ? message.role : socket.context.role
         };
 
+        refreshRoomSnapshotFromPlayback(room);
         broadcast(room, createPresencePayload(room));
         broadcastRoomSnapshot(room.roomId);
         return;
       }
 
       if (message.type === "request-sync") {
+        refreshRoomSnapshotFromPlayback(room);
         sendJson(socket, createRoomStatePayload(room));
         sendJson(socket, createPlaybackSyncPayload(room));
         return;
@@ -1831,6 +1860,7 @@ wss.on("connection", (socket, request) => {
         room.lastSeekAt = 0;
       }
 
+      refreshRoomSnapshotFromPlayback(room);
       broadcastRoomSnapshot(room.roomId);
 
       if (deleteRoomIfOrphaned(roomId)) {
