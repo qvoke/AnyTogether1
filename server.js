@@ -125,10 +125,9 @@ function createRoom(roomId, title = null, ownerId = null) {
     participants: [],
     loadedFromDisk: false,
 
-    // Playback sync properties:
     revision: 0,
     snapshot: null,
-    clients: new Set(), // Playback sync WebSocket clients (Connection 1)
+    clients: new Set(),
     control: {
       clientId: null,
       name: "",
@@ -261,6 +260,15 @@ function createRoomStatePayload(room) {
   };
 }
 
+function getClientPlaybackState(room, context) {
+  if (room.currentPlayback?.state === "paused") return "paused";
+
+  const playbackStatus = context?.playbackStatus;
+  if (!playbackStatus || playbackStatus.paused) return "paused";
+  if (playbackStatus.buffering || playbackStatus.applyingSeek) return "loading";
+  return "playing";
+}
+
 function createPresencePayload(room) {
   return {
     type: "presence",
@@ -270,12 +278,7 @@ function createPresencePayload(room) {
       clientId: client.context.clientId,
       name: client.context.name,
       role: client.context.role,
-      playbackState: client.context.playbackStatus
-        ? client.context.playbackStatus.buffering
-          || client.context.playbackStatus.applyingSeek
-          ? "loading"
-          : client.context.playbackStatus.paused ? "paused" : "playing"
-        : "loading"
+      playbackState: getClientPlaybackState(room, client.context)
     }))
   };
 }
@@ -1633,7 +1636,6 @@ function applyPlayerIntent(room, context, message, nowVal) {
     control: serializeControl(room)
   };
 
-  // Sync to UI structure
   syncRoomPlaybackState(room);
   broadcastRoomSnapshot(room.code);
   schedulePersist();
@@ -1676,11 +1678,9 @@ wss.on("connection", (socket, request) => {
   const roomQuery = url.searchParams.get("room");
   const roleQuery = url.searchParams.get("role");
 
-  // Determine if it is a playback sync engine client (Connection 1) or UI client (Connection 2)
   const isSyncEngine = roomQuery != null || roleQuery != null;
 
   if (isSyncEngine) {
-    // ---------------- PLAYBACK SYNC ENGINE PROTOCOL ----------------
     const roomId = roomQuery || "lobby";
     const role = roleQuery || "guest";
     const name = url.searchParams.get("name") || "Guest";
@@ -1705,7 +1705,6 @@ wss.on("connection", (socket, request) => {
       control: serializeControl(room)
     });
 
-    // Notify UI sockets that participant joined
     broadcastRoomSnapshot(room.roomId);
 
     socket.on("message", (raw) => {
@@ -1745,6 +1744,7 @@ wss.on("connection", (socket, request) => {
           applyingSeek: Boolean(message.applyingSeek),
           receivedAt: statusTimestamp
         };
+
         retryPendingSeekForClient(room, socket, socket.context.playbackStatus, statusTimestamp);
         broadcast(room, createPresencePayload(room));
         broadcastPlaybackSync(room);
@@ -1792,7 +1792,6 @@ wss.on("connection", (socket, request) => {
       }
 
       if (message.type === "media-request") {
-        // Forward quality/translation/episode request to all other clients in room
         broadcast(room, {
           type: "media-request",
           roomId,
@@ -1843,7 +1842,6 @@ wss.on("connection", (socket, request) => {
     });
 
   } else {
-    // ---------------- UI DIRECTORY & CHAT & PLAYLIST PROTOCOL ----------------
     connectedSockets.add(socket);
 
     socket.on("message", (raw) => {
@@ -2197,7 +2195,6 @@ wss.on("connection", (socket, request) => {
           updatedAt: now()
         };
 
-        // Sync to sync engine snapshot and broadcast to Connection 1 clients
         syncRoomSnapshotFromUI(room, item.mediaUrl, true, 0);
         broadcast(room, createRoomStatePayload(room));
 
@@ -2227,7 +2224,6 @@ wss.on("connection", (socket, request) => {
           updatedAt: now()
         };
 
-        // Sync to sync engine snapshot and broadcast to Connection 1 clients
         syncRoomSnapshotFromUI(room, message.mediaUrl, true, 0);
         broadcast(room, createRoomStatePayload(room));
 
