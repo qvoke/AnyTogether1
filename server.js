@@ -429,7 +429,9 @@ function syncRoomPlaybackState(room) {
     if (room.snapshot.mediaUrl) {
       room.currentMedia = {
         mediaUrl: room.snapshot.mediaUrl,
+        masterPlaylistUrl: room.currentMedia?.masterPlaylistUrl || null,
         pageUrl: room.currentMedia?.pageUrl || null,
+        sourcePageUrl: room.currentMedia?.sourcePageUrl || null,
         title: room.currentMedia?.title || null,
         seriesContext: room.currentMedia?.seriesContext || null,
         updatedAt: now()
@@ -555,7 +557,9 @@ function normalizePersistedRoom(roomData) {
   if (roomData?.currentMedia && typeof roomData.currentMedia === "object") {
     room.currentMedia = {
       mediaUrl: String(roomData.currentMedia.mediaUrl || ""),
+      masterPlaylistUrl: roomData.currentMedia.masterPlaylistUrl || null,
       pageUrl: roomData.currentMedia.pageUrl || null,
+      sourcePageUrl: roomData.currentMedia.sourcePageUrl || null,
       title: roomData.currentMedia.title || null,
       seriesContext: roomData.currentMedia.seriesContext || null,
       updatedAt: roomData.currentMedia.updatedAt || room.createdAt
@@ -1202,13 +1206,11 @@ function joinRoom(roomCode, socket, { nickname, clientId, canManageContent, hasE
     room: buildRoomSnapshot(room)
   });
 
-  if (state.role === "host") {
-    sendJson(socket, {
-      type: "room:role",
-      roomId: normalized,
-      role: "host"
-    });
-  }
+  sendJson(socket, {
+    type: "room:role",
+    roomId: normalized,
+    role: state.role
+  });
 
   broadcastRoomSnapshot(normalized);
   broadcastRoomsList();
@@ -1828,7 +1830,8 @@ wss.on("connection", (socket, request) => {
           requestedSeasonId: message.requestedSeasonId || null,
           requestedEpisodeId: message.requestedEpisodeId || null,
           requestedQualityLabel: message.requestedQualityLabel || null,
-          requestedTranslatorId: message.requestedTranslatorId || null
+          requestedTranslatorId: message.requestedTranslatorId || null,
+          requestToken: message.requestToken || null
         }, socket);
 
         sendJson(socket, {
@@ -2242,7 +2245,9 @@ wss.on("connection", (socket, request) => {
 
         room.currentMedia = {
           mediaUrl: String(message.mediaUrl || ""),
+          masterPlaylistUrl: message.masterPlaylistUrl || null,
           pageUrl: message.pageUrl || null,
+          sourcePageUrl: message.sourcePageUrl || null,
           title: message.title || null,
           seriesContext: nextSeriesContext,
           updatedAt: now()
@@ -2255,10 +2260,20 @@ wss.on("connection", (socket, request) => {
         };
 
         syncRoomSnapshotFromUI(room, message.mediaUrl, true, 0);
-        broadcast(room, createRoomStatePayload(room));
-
         markRoomUpdated(roomId);
+        broadcastToUiSockets(getRoomMembers(roomId), {
+          type: "media:set",
+          roomId,
+          mediaUrl: room.currentMedia.mediaUrl,
+          masterPlaylistUrl: room.currentMedia.masterPlaylistUrl,
+          pageUrl: room.currentMedia.pageUrl,
+          sourcePageUrl: room.currentMedia.sourcePageUrl,
+          title: room.currentMedia.title,
+          seriesContext: room.currentMedia.seriesContext,
+          originId: message.originId || null
+        });
         broadcastRoomSnapshot(roomId);
+        broadcast(room, createRoomStatePayload(room));
         broadcastRoomsList();
         return;
       }
