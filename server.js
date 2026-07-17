@@ -45,6 +45,7 @@ const defaultPlaybackSnapshot = {
 const rooms = new Map();
 const roomMembers = new Map();
 const socketState = new Map();
+const participantOfflineTimers = new WeakMap();
 const connectedSockets = new Set();
 const usersById = new Map();
 const sessionsByToken = new Map();
@@ -197,6 +198,9 @@ function getSocketState(socket) {
       userId: null,
       sessionToken: null,
       rooms: new Set(),
+      leftRooms: new Set(),
+      keepNotInRoom: new Set(),
+      presenceRooms: new Set(),
       joinedAtByRoom: {}
     });
   }
@@ -927,8 +931,15 @@ function compareParticipantRecords(left, right) {
     return String(left.role || "guest") === "host" ? -1 : 1;
   }
 
-  if (Boolean(left.connected) !== Boolean(right.connected)) {
-    return left.connected ? -1 : 1;
+  const presencePriority = {
+    online: 0,
+    "not-in-room": 1,
+    offline: 2
+  };
+  const leftPriority = presencePriority[left.presenceStatus] ?? (left.connected ? 0 : 2);
+  const rightPriority = presencePriority[right.presenceStatus] ?? (right.connected ? 0 : 2);
+  if (leftPriority !== rightPriority) {
+    return leftPriority - rightPriority;
   }
 
   return (left.joinedAt || 0) - (right.joinedAt || 0);
@@ -942,13 +953,22 @@ function findParticipantRecord(room, state, socket = null) {
   const socketId = state?.socketId ? String(state.socketId) : null;
   const fallbackClientId = socket?.context?.clientId ? String(socket.context.clientId) : null;
 
-  return room.participants.find((participant) => {
+  const matched = room.participants.find((participant) => {
     if (clientId && participant.clientId === clientId) return true;
     if (userId && participant.userId === userId) return true;
     if (socketId && participant.socketId === socketId) return true;
     if (fallbackClientId && participant.clientId === fallbackClientId) return true;
     return false;
-  }) || null;
+  });
+  if (matched) return matched;
+
+  if (!userId && state?.nickname) {
+    return room.participants.find((participant) =>
+      !participant.userId && participant.nickname === state.nickname
+    ) || null;
+  }
+
+  return null;
 }
 
 function syncRoomParticipant(room, socket, { connected = true } = {}) {
@@ -978,6 +998,7 @@ function syncRoomParticipant(room, socket, { connected = true } = {}) {
         if (!participant) return false;
         if (nextRecord.clientId && participant.clientId === nextRecord.clientId) return false;
         if (nextRecord.userId && participant.userId === nextRecord.userId) return false;
+        if (!nextRecord.userId && !participant.userId && participant.nickname === nextRecord.nickname) return false;
         if (!nextRecord.clientId && !nextRecord.userId && nextRecord.socketId && participant.socketId === nextRecord.socketId) return false;
         return true;
       })
@@ -1010,6 +1031,43 @@ function markRoomParticipantNotInRoom(room, socket) {
   record.presenceStatus = "not-in-room";
   record.socketId = null;
   record.lastSeenAt = now();
+  schedulePersist();
+}
+
+function scheduleParticipantOffline(room, record) {
+  if (!room || !record) return;
+  clearTimeout(participantOfflineTimers.get(record));
+  const timer = setTimeout(() => {
+    record.connected = false;
+    record.presenceStatus = "offline";
+    participantOfflineTimers.delete(record);
+    record.lastSeenAt = now();
+    schedulePersist();
+    if (!deleteRoomIfOrphaned(room.code)) {
+      broadcastRoomSnapshot(room.code);
+      broadcastRoomsList();
+    }
+  }, 15000);
+  participantOfflineTimers.set(record, timer);
+}
+
+function confirmSitePresence(state) {
+  for (const room of rooms.values()) {
+    const record = room.participants?.find((participant) =>
+      state.userId
+        ? participant.userId === state.userId
+        : !participant.userId && participant.nickname === state.nickname
+    );
+    if (!record) continue;
+
+    clearTimeout(participantOfflineTimers.get(record));
+    participantOfflineTimers.delete(record);
+    record.connected = false;
+    record.presenceStatus = "not-in-room";
+    record.lastSeenAt = now();
+    state.presenceRooms.add(room.code);
+    broadcastRoomSnapshot(room.code);
+  }
   schedulePersist();
 }
 
@@ -1104,6 +1162,7 @@ function joinRoom(roomCode, socket, { nickname, clientId, canManageContent, hasE
 
   getRoomMembers(normalized).add(socket);
   state.rooms.add(normalized);
+  state.leftRooms.delete(normalized);
   state.joinedAtByRoom[normalized] = now();
   syncRoomParticipant(room, socket, { connected: true });
   schedulePersist();
@@ -1126,7 +1185,7 @@ function joinRoom(roomCode, socket, { nickname, clientId, canManageContent, hasE
   broadcastRoomsList();
 }
 
-function leaveRoomFromUI(roomCode, socket) {
+function leaveRoomFromUI(roomCode, socket, { keepNotInRoom = false } = {}) {
   const normalized = normalizeRoomCode(roomCode);
   if (!normalized) return;
 
@@ -1136,6 +1195,12 @@ function leaveRoomFromUI(roomCode, socket) {
 
   getRoomMembers(normalized).delete(socket);
   state.rooms.delete(normalized);
+  state.leftRooms.add(normalized);
+  if (keepNotInRoom) {
+    state.keepNotInRoom.add(normalized);
+  } else {
+    state.keepNotInRoom.delete(normalized);
+  }
   delete state.joinedAtByRoom[normalized];
 
   if (room) {
@@ -1171,13 +1236,18 @@ function leaveAllRooms(socket) {
 function detachSocketFromRooms(socket) {
   const state = getSocketState(socket);
 
-  for (const roomCode of [...state.rooms]) {
+  for (const roomCode of new Set([...state.rooms, ...state.leftRooms, ...state.presenceRooms])) {
     const normalized = normalizeRoomCode(roomCode);
     const room = rooms.get(normalized);
     getRoomMembers(normalized).delete(socket);
     delete state.joinedAtByRoom[normalized];
     if (room) {
-      markRoomParticipantDisconnected(room, socket);
+      if (state.presenceRooms.has(normalized) || !state.keepNotInRoom.has(normalized)) {
+        markRoomParticipantDisconnected(room, socket);
+      } else {
+        const record = findParticipantRecord(room, state, socket);
+        scheduleParticipantOffline(room, record);
+      }
       schedulePersist();
       if (!deleteRoomIfOrphaned(normalized)) {
         broadcastRoomSnapshot(normalized);
@@ -1187,6 +1257,9 @@ function detachSocketFromRooms(socket) {
   }
 
   state.rooms.clear();
+  state.leftRooms.clear();
+  state.keepNotInRoom.clear();
+  state.presenceRooms.clear();
 }
 
 // REST API Request handler
@@ -1842,10 +1915,21 @@ wss.on("connection", (socket, request) => {
         return;
       }
 
+      if (message.type === "presence:active") {
+        if (message.nickname) {
+          state.nickname = normalizeNickname(message.nickname);
+        }
+        if (!state.userId && message.userId) {
+          state.userId = String(message.userId).trim() || null;
+        }
+        confirmSitePresence(state);
+        return;
+      }
+
       if (message.type === "room:leave") {
         const roomId = normalizeRoomCode(message.roomId);
         if (!roomId) return;
-        leaveRoomFromUI(roomId, socket);
+        leaveRoomFromUI(roomId, socket, { keepNotInRoom: message.keepNotInRoom === true });
         return;
       }
 
@@ -1874,6 +1958,10 @@ wss.on("connection", (socket, request) => {
         }
 
         state.nickname = nextNickname;
+
+        if (state.rooms.size === 0) {
+          confirmSitePresence(state);
+        }
 
         for (const joinedRoomId of state.rooms) {
           const room = rooms.get(joinedRoomId);
