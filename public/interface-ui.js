@@ -1171,6 +1171,59 @@ function createDefaultUi(seriesContext) {
   };
 }
 
+function hasNavigableSeriesContext(seriesContext) {
+  const seasons = Array.isArray(seriesContext?.seasons) ? seriesContext.seasons : [];
+  const episodes = Array.isArray(seriesContext?.episodes) ? seriesContext.episodes : [];
+  return seasons.length > 0 || episodes.length > 0;
+}
+
+function isSameSourcePage(payload, previousMedia) {
+  const incomingUrls = [payload?.sourcePageUrl, payload?.pageUrl].filter(Boolean);
+  const previousUrls = [previousMedia?.sourcePageUrl, previousMedia?.pageUrl].filter(Boolean);
+  return incomingUrls.some((incomingUrl) => previousUrls.includes(incomingUrl));
+}
+
+function mergePartialSeriesContext(incomingContext, previousContext) {
+  if (!incomingContext) return previousContext || null;
+  if (!previousContext || hasNavigableSeriesContext(incomingContext)) return incomingContext;
+
+  return {
+    ...previousContext,
+    ...incomingContext,
+    seasons: previousContext.seasons,
+    episodes: previousContext.episodes,
+    translators: Array.isArray(incomingContext.translators) && incomingContext.translators.length > 0
+      ? incomingContext.translators
+      : previousContext.translators,
+    resolver: incomingContext.resolver || previousContext.resolver
+  };
+}
+
+function hasSeriesContextUpgrade(incomingContext, currentContext) {
+  if (!incomingContext) return false;
+  if (!currentContext) return true;
+
+  for (const key of ["seasons", "episodes", "translators", "availableQualities"]) {
+    const incomingCount = Array.isArray(incomingContext[key]) ? incomingContext[key].length : 0;
+    const currentCount = Array.isArray(currentContext[key]) ? currentContext[key].length : 0;
+    if (incomingCount > currentCount) return true;
+  }
+
+  for (const key of ["currentSeasonId", "currentEpisodeId", "selectedTranslatorId"]) {
+    if (incomingContext[key] != null && Number(incomingContext[key]) !== Number(currentContext[key])) return true;
+  }
+
+  if (incomingContext.selectedQualityLabel && incomingContext.selectedQualityLabel !== currentContext.selectedQualityLabel) return true;
+
+  const incomingResolverItemId = Number(incomingContext.resolver?.itemId);
+  const currentResolverItemId = Number(currentContext.resolver?.itemId);
+  if (Number.isFinite(incomingResolverItemId) && incomingResolverItemId !== currentResolverItemId) return true;
+
+  if (incomingContext.title && incomingContext.title !== currentContext.title) return true;
+
+  return Boolean(incomingContext.resolver && !currentContext.resolver);
+}
+
 function getHighestQuality(qualities) {
   if (!Array.isArray(qualities) || qualities.length === 0) return null;
   return qualities
@@ -1271,14 +1324,14 @@ function isSameSeriesContext(left, right) {
   return leftIdentity === rightIdentity;
 }
 
-function mergeUiFromSeriesContext(roomState, seriesContext, previousSeriesContext = null) {
+function mergeUiFromSeriesContext(roomState, seriesContext, previousSeriesContext = null, options = {}) {
   const currentUi = roomState?.ui || {};
   const defaultUi = createDefaultUi(seriesContext);
   const seasons = Array.isArray(seriesContext?.seasons) ? seriesContext.seasons : [];
   const translators = Array.isArray(seriesContext?.translators) ? seriesContext.translators : [];
   const qualities = Array.isArray(seriesContext?.availableQualities) ? seriesContext.availableQualities : [];
   const pendingEpisode = getPendingEpisodeSelection(roomState);
-  const preserveCurrentUi = isSameSeriesContext(previousSeriesContext, seriesContext);
+  const preserveCurrentUi = !options.preferContextSelection && isSameSeriesContext(previousSeriesContext, seriesContext);
 
   if (pendingEpisode) {
     return {
@@ -3890,7 +3943,15 @@ function updateRoomFromMediaPayload(roomId, payload, shouldBroadcast) {
   const roomState = ensureRoomState(normalized);
   const previousMedia = roomState.currentMedia || null;
   const previousSeriesContext = previousMedia?.seriesContext || null;
-  const nextSeriesContext = payload.seriesContext ?? previousMedia?.seriesContext ?? null;
+  const shouldPreserveNavigationContext =
+    previousSeriesContext &&
+    hasNavigableSeriesContext(previousSeriesContext) &&
+    payload.seriesContext &&
+    !hasNavigableSeriesContext(payload.seriesContext) &&
+    isSameSourcePage(payload, previousMedia);
+  const nextSeriesContext = shouldPreserveNavigationContext
+    ? mergePartialSeriesContext(payload.seriesContext, previousSeriesContext)
+    : (payload.seriesContext ?? previousSeriesContext ?? null);
   const nextPageUrl = pickResolverPageUrl(
     payload.pageUrl,
     nextSeriesContext?.resolver?.pageUrl,
@@ -3914,7 +3975,9 @@ function updateRoomFromMediaPayload(roomId, payload, shouldBroadcast) {
     addedToPlaylistId: payload.addedToPlaylistId || null
   };
   if (payload.seriesContext) {
-    roomState.ui = mergeUiFromSeriesContext(roomState, nextSeriesContext, previousSeriesContext);
+    roomState.ui = mergeUiFromSeriesContext(roomState, nextSeriesContext, previousSeriesContext, {
+      preferContextSelection: true
+    });
   } else if (!roomState.ui) {
     roomState.ui = createDefaultUi(nextSeriesContext);
   }
@@ -4971,8 +5034,10 @@ async function start() {
 
       const now = Date.now();
 
-      const hasSeriesContext = payload.seriesContext &&
-        (Array.isArray(payload.seriesContext.seasons) || Array.isArray(payload.seriesContext.episodes));
+      const hasSeriesContext = hasNavigableSeriesContext(payload.seriesContext);
+      if (!incomingRoomId && hasSeriesContext) {
+        clearPendingEpisodeSelection(roomState);
+      }
       const pendingEpisode = getPendingEpisodeSelection(roomState);
       const payloadSeasonId = Number(payload.seriesContext?.currentSeasonId);
       const payloadEpisodeId = Number(payload.seriesContext?.currentEpisodeId);
@@ -4999,15 +5064,21 @@ async function start() {
         _lastLoadBlockedUntil = 0;
       }
 
+      const currentSeriesContext = roomState.currentMedia?.seriesContext || null;
+      const contextWasExpanded = hasSeriesContextUpgrade(payload.seriesContext, currentSeriesContext);
       if (mediaUrl === _lastLoadedMediaKey) {
-        if (_lastLoadHadContext) {
+        if (_lastLoadHadContext && !contextWasExpanded) {
           appendPlaybackDebugEntry("Ignoring duplicate media URL (already loaded with context)", { url: mediaUrl.substring(0, 80) });
           return;
         }
-        if (hasSeriesContext) {
+        if (hasSeriesContext || contextWasExpanded) {
           appendPlaybackDebugEntry("Replacing URL with series context", { url: mediaUrl.substring(0, 80) });
           _lastLoadBlockedUntil = 0;
         }
+      }
+
+      if (contextWasExpanded) {
+        _lastLoadBlockedUntil = 0;
       }
 
       if (now < _lastLoadBlockedUntil) {
@@ -5017,7 +5088,7 @@ async function start() {
 
       _lastLoadedMediaKey = mediaUrl;
       _lastLoadBlockedUntil = now + LOAD_BLOCK_DURATION_MS;
-      _lastLoadHadContext = hasSeriesContext;
+      _lastLoadHadContext = hasSeriesContext || hasNavigableSeriesContext(roomState.currentMedia?.seriesContext);
 
 
       // Show selected quality from extension in indicator
