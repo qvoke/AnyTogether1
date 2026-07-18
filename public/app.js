@@ -56,6 +56,7 @@ const state = {
   pendingInterfaceMediaUrl: null,
   lastPlaybackStatusDebugSignature: "",
   lastPresenceDebugSignature: "",
+  lastMemberRenderSignature: "",
   currentRevision: 0,
   playbackSyncOffsets: new Map(),
   lastPlaybackCorrectionAt: 0,
@@ -1449,6 +1450,25 @@ function connectRoom() {
       return;
     }
 
+    if (message.type === "series-context") {
+      console.log(
+        `[Playback] Series context received room=${message.roomId || "unknown"} ` +
+        `episodes=${Array.isArray(message.seriesContext?.episodes) ? message.seriesContext.episodes.length : 0} ` +
+        `serverSentAt=${message.serverSentAt || 0} browserReceivedAt=${Date.now()}`
+      );
+      window.postMessage({
+        type: "anytogether:series-context",
+        roomId: message.roomId,
+        pageUrl: message.pageUrl || null,
+        sourcePageUrl: message.sourcePageUrl || null,
+        title: message.title || null,
+        seriesContext: message.seriesContext || null,
+        originId: message.originId || null,
+        serverSentAt: message.serverSentAt || null
+      }, "*");
+      return;
+    }
+
     if (message.type === "player-ack") {
       if (typeof message.revision === "number") {
         state.currentRevision = Math.max(state.currentRevision, message.revision);
@@ -1659,7 +1679,6 @@ window.__getPlaybackSyncInfo = (participantClientId = state.clientId) => {
 setInterval(reportPlaybackStatus, playbackStatusIntervalMs);
 
 function renderMembers(members) {
-  elements.memberList.innerHTML = "";
   const playbackStates = members
     .map((member) => `${member.clientId}:${member.playbackState || "paused"}`)
     .sort();
@@ -1668,16 +1687,25 @@ function renderMembers(members) {
   if (debugSignature !== state.lastPresenceDebugSignature) {
     state.lastPresenceDebugSignature = debugSignature;
     logEvent("Participant playback received", debugSignature || "none");
+    window.postMessage({
+      type: "anytogether:participant-playback",
+      roomId: state.room,
+      members: members.map((member) => ({
+        clientId: member.clientId,
+        playbackState: member.playbackState || "paused"
+      }))
+    }, "*");
   }
 
-  window.postMessage({
-    type: "anytogether:participant-playback",
-    roomId: state.room,
-    members: members.map((member) => ({
-      clientId: member.clientId,
-      playbackState: member.playbackState || "paused"
-    }))
-  }, "*");
+  const renderSignature = JSON.stringify(members.map((member) => ({
+    clientId: member.clientId,
+    name: member.name,
+    role: member.role,
+    playbackState: member.playbackState || "paused"
+  })));
+  if (renderSignature === state.lastMemberRenderSignature) return;
+  state.lastMemberRenderSignature = renderSignature;
+  elements.memberList.innerHTML = "";
 
   if (!members.length) {
     const empty = document.createElement("div");

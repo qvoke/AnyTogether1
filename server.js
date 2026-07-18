@@ -41,9 +41,9 @@ const defaultPlaybackSnapshot = {
   muted: false
 };
 
-// Unified Maps and Sets
 const rooms = new Map();
 const roomMembers = new Map();
+const playbackSeriesContextSignatures = new Map();
 const socketState = new Map();
 const participantOfflineTimers = new WeakMap();
 const connectedSockets = new Set();
@@ -281,6 +281,24 @@ function createPresencePayload(room) {
       playbackState: getClientPlaybackState(room, client.context)
     }))
   };
+}
+
+function broadcastSeriesContextToPlayback(room, originId = null) {
+  if (!room?.currentMedia?.seriesContext) return;
+  const contextSignature = JSON.stringify(room.currentMedia.seriesContext);
+  if (playbackSeriesContextSignatures.get(room.roomId) === contextSignature) return;
+  playbackSeriesContextSignatures.set(room.roomId, contextSignature);
+  const serverSentAt = now();
+  broadcast(room, {
+    type: "series-context",
+    roomId: room.roomId,
+    pageUrl: room.currentMedia.pageUrl || null,
+    sourcePageUrl: room.currentMedia.sourcePageUrl || null,
+    title: room.currentMedia.title || room.currentMedia.seriesContext.title || null,
+    seriesContext: room.currentMedia.seriesContext,
+    originId,
+    serverSentAt
+  });
 }
 
 function projectPlaybackStatus(status, timestamp) {
@@ -1436,6 +1454,7 @@ async function handleApiRequest(request, response, url) {
     }
 
     rooms.delete(roomCode);
+    playbackSeriesContextSignatures.delete(roomCode);
     if (user) {
       detachRoomFromUser(user.id, roomCode);
     }
@@ -1770,6 +1789,7 @@ wss.on("connection", (socket, request) => {
 
       if (message.type === "playback-status") {
         const statusTimestamp = now();
+        const previousPlaybackState = getClientPlaybackState(room, socket.context);
         socket.context.playbackStatus = {
           clientId: socket.context.clientId,
           currentTime: clampCurrentTime(message.currentTime),
@@ -1780,7 +1800,9 @@ wss.on("connection", (socket, request) => {
         };
 
         retryPendingSeekForClient(room, socket, socket.context.playbackStatus, statusTimestamp);
-        broadcast(room, createPresencePayload(room));
+        if (getClientPlaybackState(room, socket.context) !== previousPlaybackState) {
+          broadcast(room, createPresencePayload(room));
+        }
         broadcastPlaybackSync(room);
         return;
       }
@@ -2252,6 +2274,44 @@ wss.on("connection", (socket, request) => {
         return;
       }
 
+      if (message.type === "series-context:set") {
+        const roomId = normalizeRoomCode(message.roomId);
+        const room = rooms.get(roomId);
+        if (!room || !message.seriesContext) return;
+
+        room.currentMedia = {
+          mediaUrl: room.currentMedia?.mediaUrl || "",
+          masterPlaylistUrl: room.currentMedia?.masterPlaylistUrl || null,
+          pageUrl: message.pageUrl || room.currentMedia?.pageUrl || null,
+          sourcePageUrl: message.sourcePageUrl || room.currentMedia?.sourcePageUrl || null,
+          title: message.title || message.seriesContext.title || room.currentMedia?.title || null,
+          seriesContext: message.seriesContext,
+          updatedAt: now()
+        };
+
+        markRoomUpdated(roomId);
+        const contextReceivedAt = now();
+        sendJson(socket, {
+          type: "series-context:ack",
+          roomId,
+          contextEventId: message.contextEventId || null,
+          receivedAt: contextReceivedAt
+        });
+        broadcastToUiSockets(getRoomMembers(roomId), {
+          type: "series-context:set",
+          contextEventId: message.contextEventId || null,
+          receivedAt: contextReceivedAt,
+          roomId,
+          pageUrl: room.currentMedia.pageUrl,
+          sourcePageUrl: room.currentMedia.sourcePageUrl,
+          title: room.currentMedia.title,
+          seriesContext: room.currentMedia.seriesContext,
+          originId: message.originId || null
+        });
+        broadcastSeriesContextToPlayback(room, message.originId || null);
+        return;
+      }
+
       if (message.type === "media:set") {
         const roomId = normalizeRoomCode(message.roomId);
         const room = rooms.get(roomId);
@@ -2287,6 +2347,7 @@ wss.on("connection", (socket, request) => {
           seriesContext: room.currentMedia.seriesContext,
           originId: message.originId || null
         });
+        broadcastSeriesContextToPlayback(room, message.originId || null);
         broadcastRoomSnapshot(roomId);
         broadcast(room, createRoomStatePayload(room));
         broadcastRoomsList();
@@ -2303,6 +2364,7 @@ wss.on("connection", (socket, request) => {
         if (room && room.clients.size === 0 && (!room.participants || room.participants.length === 0)) {
           rooms.delete(roomCode);
           roomMembers.delete(roomCode);
+          playbackSeriesContextSignatures.delete(roomCode);
         }
       }
       broadcastRoomsList();
