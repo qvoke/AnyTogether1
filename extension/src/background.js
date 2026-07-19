@@ -209,12 +209,65 @@ function loadSeriesContextFromHtml(pageUrl, targetTabId) {
   return request;
 }
 
+function resolveConfiguredPageMedia(pageUrl, targetUiTabId, options = {}) {
+  const requestKey = JSON.stringify({
+    targetUiTabId,
+    pageUrl: normalizePageUrl(pageUrl) || pageUrl,
+    seasonId: options.seasonId ?? null,
+    episodeId: options.episodeId ?? null,
+    translatorId: options.translatorId ?? null,
+    qualityLabel: options.qualityLabel || null
+  });
+  const existingRequest = CONFIGURED_MEDIA_REQUESTS.get(requestKey);
+  if (existingRequest) return existingRequest;
+
+  const request = resolveConfiguredPageMediaInternal(pageUrl, targetUiTabId, options)
+    .finally(() => {
+      if (CONFIGURED_MEDIA_REQUESTS.get(requestKey) === request) {
+        CONFIGURED_MEDIA_REQUESTS.delete(requestKey);
+      }
+    });
+  CONFIGURED_MEDIA_REQUESTS.set(requestKey, request);
+  return request;
+}
+
+async function resolveConfiguredPageMediaInternal(pageUrl, targetUiTabId, options) {
+  const startedAt = Date.now();
+  const seriesContext = await loadSeriesContextFromHtml(pageUrl, targetUiTabId);
+  if (!seriesContext) {
+    reportExtractionDiagnostic(targetUiTabId, "configured-media-context-unavailable", {
+      pageUrl,
+      durationMs: Date.now() - startedAt
+    });
+    return null;
+  }
+  sendSeriesContextToUi(targetUiTabId, pageUrl, seriesContext);
+
+  const resolution = await resolveMediaFromSeriesContext(pageUrl, seriesContext, options);
+  if (!resolution?.mediaUrl) {
+    reportExtractionDiagnostic(targetUiTabId, "configured-media-resolution-unavailable", {
+      pageUrl,
+      durationMs: Date.now() - startedAt
+    });
+    return null;
+  }
+
+  const resolvedContext = cacheSeriesContext(pageUrl, resolution.seriesContext || seriesContext);
+  sendSeriesContextToUi(targetUiTabId, pageUrl, resolvedContext);
+  reportExtractionDiagnostic(targetUiTabId, "configured-media-resolved", {
+    pageUrl,
+    durationMs: Date.now() - startedAt,
+    qualities: Array.isArray(resolvedContext.availableQualities) ? resolvedContext.availableQualities.length : 0
+  });
+  return {
+    ...resolution,
+    pageUrl,
+    seriesContext: resolvedContext
+  };
+}
+
 function sendConfiguredHtmlContextToUi(pageUrl, targetUiTabId) {
-  void loadSeriesContextFromHtml(pageUrl, targetUiTabId)
-    .then((seriesContext) => {
-      if (seriesContext) sendSeriesContextToUi(targetUiTabId, pageUrl, seriesContext);
-    })
-    .catch(() => {});
+  void resolveConfiguredPageMedia(pageUrl, targetUiTabId).catch(() => {});
 }
 
 function buildSearchUrl(query) {
@@ -461,6 +514,42 @@ function buildDirectStreamResolution(resolverConfig, ajaxData, seriesContext, ta
   };
 }
 
+async function resolveMediaFromSeriesContext(pageUrl, seriesContext, options = {}) {
+  if (!seriesContext?.resolver) return null;
+
+  const episodes = Array.isArray(seriesContext.episodes) ? seriesContext.episodes : [];
+  const fallbackEpisode = episodes[Number(seriesContext.currentEpisodeIndex) || 0] || null;
+  const targetEpisode = {
+    seasonId: options.seasonId ?? seriesContext.currentSeasonId ?? fallbackEpisode?.seasonId,
+    episodeId: options.episodeId ?? seriesContext.currentEpisodeId ?? fallbackEpisode?.episodeId
+  };
+  if (!Number.isFinite(Number(targetEpisode.seasonId)) || !Number.isFinite(Number(targetEpisode.episodeId))) {
+    return null;
+  }
+
+  const profile = await getParserConfigForUrl(pageUrl);
+  const resolverConfig = findDirectResolverConfig(profile, seriesContext);
+  if (!resolverConfig) return null;
+
+  const resolverOptions = {
+    translatorId: options.translatorId ?? seriesContext.selectedTranslatorId,
+    qualityLabel: options.qualityLabel ?? seriesContext.selectedQualityLabel
+  };
+  const resolverData = await fetchDirectStreamList(
+    resolverConfig,
+    seriesContext,
+    targetEpisode,
+    resolverOptions
+  );
+  return buildDirectStreamResolution(
+    resolverConfig,
+    resolverData,
+    seriesContext,
+    targetEpisode,
+    resolverOptions
+  );
+}
+
 // ---------- HLS Master playlist resolver ----------
 
 function isMasterPlaylist(playlistText) {
@@ -551,11 +640,6 @@ async function fetchPlaylist(url) {
   }
 }
 
-/**
- * Given an .m3u8 URL, try to resolve to best quality variant:
- * 2. If it's a media playlist, try common master playlist names in same dir
- * 3. Return the best quality media URL + master URL for hls.js
- */
 function isMasterByFilename(filename) {
   const base = filename.split('?')[0].split('#')[0].toLowerCase();
   if (/^(master|index|playlist|manifest|multi|variant|adaptive)/i.test(base)) return true;
@@ -565,10 +649,8 @@ function isMasterByFilename(filename) {
 
 function guessResolutionFromFilename(filename) {
   const base = filename.split('?')[0].split('#')[0];
-  // 1080p, 720p, 360p
   const labeled = base.match(/(\d{3,4})\s*p/i);
   if (labeled) return parseInt(labeled[1], 10);
-  // 1920x1080, 1280x720
   const dims = base.match(/(\d+)x(\d+)/i);
   if (dims) return parseInt(dims[2], 10);
   const number = base.match(/(\d{3,4})(?:\.[^.]+)?$/);
@@ -674,6 +756,7 @@ function normalizePageUrl(value) {
 const SERIES_CONTEXT_CACHE = new Map();
 const CONFIGURED_HTML_CONTEXT_URLS = new Set();
 const BACKGROUND_HTML_CONTEXT_REQUESTS = new Map();
+const CONFIGURED_MEDIA_REQUESTS = new Map();
 const RESOLVE_REQUESTS_IN_FLIGHT = new Map();
 const RESOLVER_TAB_IDS = new Set();
 const SUPPRESSED_RESOLVER_PAGE_URLS = new Map();
@@ -1583,6 +1666,17 @@ async function resolvePageToMediaOnce(pageUrl, hostTabId, statusPrefix, targetEp
   RESOLVE_REQUESTS_IN_FLIGHT.set(key, promise);
   return promise;
 }
+
+async function resolveFirstAvailableMedia(requests) {
+  try {
+    return await Promise.any(requests.map((request) => Promise.resolve(request).then((resolution) => {
+      if (resolution?.mediaUrl) return resolution;
+      throw new Error("Media resolution returned no URL");
+    })));
+  } catch {
+    return null;
+  }
+}
 // Extract real URL from DuckDuckGo redirect (/l/?uddg=...)
 function extractRealDdgUrl(url) {
   try {
@@ -1598,17 +1692,10 @@ const FORWARDED_MEDIA_DEDUP_MS = 30000;
 const FORWARDED_MEDIA_CACHE = new Map();
 const MEDIA_FORWARD_IN_FLIGHT = new Map();
 
-function buildMediaForwardSignature(pageUrl, seriesContext, sourcePageUrl, targetUiTabId = null) {
-  const context = seriesContext || {};
+function buildMediaForwardSignature(pageUrl, sourcePageUrl, targetUiTabId = null) {
   return JSON.stringify({
     sourcePageUrl: normalizePageUrl(sourcePageUrl || pageUrl) || String(sourcePageUrl || pageUrl || ""),
-    targetUiTabId: Number.isFinite(targetUiTabId) ? targetUiTabId : null,
-    seasonId: context.currentSeasonId ?? null,
-    episodeId: context.currentEpisodeId ?? null,
-    translatorId: context.selectedTranslatorId ?? null,
-    qualityLabel: context.selectedQualityLabel || null,
-    seasonCount: Array.isArray(context.seasons) ? context.seasons.length : 0,
-    episodeCount: Array.isArray(context.episodes) ? context.episodes.length : 0
+    targetUiTabId: Number.isFinite(targetUiTabId) ? targetUiTabId : null
   });
 }
 
@@ -1812,7 +1899,6 @@ chrome.webRequest.onBeforeRequest.addListener(
       return;
     }
 
-    // Skip requests initiated by our own UI page to avoid loops
     if (details.initiator && details.initiator.includes('localhost:3000')) {
       return;
     }
@@ -1820,17 +1906,13 @@ chrome.webRequest.onBeforeRequest.addListener(
       return;
     }
 
-    // Always sniff from the search popup (opened via "Search" button).
-    // Support tabId === -1 for media requests triggered directly by Chrome's media subsystem on the popup tab.
     const isSearchPopup = (tabId > 0 && tabId === _searchPopupTabId) || (_searchPopupTabId !== null && tabId === -1);
 
-    // Gate: only sniff when user explicitly enabled it (or it's the search popup)
     if (!_snifferActive && !isSearchPopup) return;
 
     const url = details.url || '';
     if (!isValidMediaUrlSniffer(url)) return;
 
-    // Skip URLs from our own player (localhost:3000)
     if (tabId > 0 && MEDIA_SNIFFER_UI_CACHE.has(tabId)) return;
 
     console.log("[Background] Media URL sniffed:", url.substring(0, 100));
@@ -1839,28 +1921,15 @@ chrome.webRequest.onBeforeRequest.addListener(
       if (!allTabs || !allTabs.length) return;
       const uiTabs = allTabs.filter(t => t.status === 'complete' && t.url && t.url.includes('localhost:3000'));
 
-      // Cache UI tab IDs to skip them on future requests
       for (const tab of uiTabs) {
         MEDIA_SNIFFER_UI_CACHE.add(tab.id);
       }
 
-      // Check if this request is from our own UI tab
       if (uiTabs.some(t => t.id === tabId)) return;
 
-      const dispatch = async (sourcePageUrl, sourceTabId = null) => {
+      const dispatch = (sourcePageUrl, sourceTabId = null) => {
         const resolvedSourcePageUrl = pickSourcePageUrl(sourcePageUrl, details.documentUrl, details.originUrl, details.initiator);
-        let seriesContext = getCachedSeriesContext(resolvedSourcePageUrl);
-
-        if (!seriesContext && Number.isFinite(sourceTabId) && resolvedSourcePageUrl) {
-          try {
-            seriesContext = await extractSeriesContextFromPage(sourceTabId, resolvedSourcePageUrl);
-            if (seriesContext) {
-              cacheSeriesContext(resolvedSourcePageUrl, seriesContext);
-            }
-          } catch {
-            seriesContext = null;
-          }
-        }
+        const seriesContext = getCachedSeriesContext(resolvedSourcePageUrl);
 
         void forwardMediaToUi(
           url,
@@ -1875,13 +1944,13 @@ chrome.webRequest.onBeforeRequest.addListener(
       if (typeof tabId === "number" && tabId > 0) {
         chrome.tabs.get(tabId, (tab) => {
           const sourcePageUrl = pickSourcePageUrl(tab?.url, details.documentUrl, details.originUrl, details.initiator);
-          void dispatch(sourcePageUrl, tabId);
+          dispatch(sourcePageUrl, tabId);
         });
         return;
       }
 
       const fallbackSourceTabId = Number.isFinite(_searchPopupTabId) ? _searchPopupTabId : null;
-      void dispatch(pickSourcePageUrl(details.documentUrl, details.originUrl, details.initiator), fallbackSourceTabId);
+      dispatch(pickSourcePageUrl(details.documentUrl, details.originUrl, details.initiator), fallbackSourceTabId);
     });
   },
   { urls: ["<all_urls>"] },
@@ -1913,8 +1982,26 @@ function forwardMediaToUi(mediaUrl, pageUrl, seriesContext, sourcePageUrl = null
   return request;
 }
 
+function sendMediaPayloadToUi(targetUiTabId, payload) {
+  chrome.tabs.query({}, (allTabs) => {
+    if (!allTabs) return;
+    allTabs
+      .filter((tab) =>
+        tab.status === "complete" &&
+        tab.url?.includes("localhost:3000") &&
+        (!Number.isFinite(targetUiTabId) || tab.id === targetUiTabId)
+      )
+      .forEach((tab) => {
+        sendTabMessage(tab.id, {
+          type: "WT_MEDIA_FOUND",
+          payload
+        });
+      });
+  });
+}
+
 async function resolveAndForwardMediaToUi(mediaUrl, pageUrl, seriesContext, sourcePageUrl, sourceTabId, targetUiTabId) {
-  const signature = buildMediaForwardSignature(pageUrl, seriesContext, sourcePageUrl, targetUiTabId);
+  const signature = buildMediaForwardSignature(pageUrl, sourcePageUrl, targetUiTabId);
   const now = Date.now();
   const lastSeen = FORWARDED_MEDIA_CACHE.get(signature) || 0;
   if (now - lastSeen < FORWARDED_MEDIA_DEDUP_MS) {
@@ -1922,21 +2009,39 @@ async function resolveAndForwardMediaToUi(mediaUrl, pageUrl, seriesContext, sour
   }
   FORWARDED_MEDIA_CACHE.set(signature, now);
 
-  let resolvedMediaUrl = mediaUrl;
-  let resolvedMasterPlaylistUrl = null;
-  let resolvedSeriesContext = seriesContext || null;
+  const resolverPageUrl = sourcePageUrl || pageUrl;
+  let resolvedSeriesContext = seriesContext || getCachedSeriesContext(sourcePageUrl || pageUrl) || null;
+  sendMediaPayloadToUi(targetUiTabId, {
+    roomId: null,
+    mediaUrl,
+    masterPlaylistUrl: null,
+    pageUrl: pageUrl || mediaUrl,
+    sourcePageUrl: sourcePageUrl || pageUrl || mediaUrl,
+    seriesContext: resolvedSeriesContext,
+  });
 
-  if (!resolvedSeriesContext && Number.isFinite(sourceTabId)) {
-    const resolverPageUrl = sourcePageUrl || pageUrl;
+  if (
+    Number.isFinite(targetUiTabId) &&
+    resolverPageUrl &&
+    !isMediaLikePageUrl(resolverPageUrl) &&
+    !resolvedSeriesContext?.resolver
+  ) {
+    const configuredContext = await loadSeriesContextFromHtml(resolverPageUrl, targetUiTabId);
+    if (configuredContext?.resolver) {
+      resolvedSeriesContext = configuredContext;
+    }
+  }
+
+  if (!resolvedSeriesContext?.resolver && Number.isFinite(sourceTabId)) {
     resolvedSeriesContext = getCachedSeriesContext(resolverPageUrl);
-    if (!resolvedSeriesContext && resolverPageUrl && !isMediaLikePageUrl(resolverPageUrl)) {
+    if (!resolvedSeriesContext?.resolver && resolverPageUrl && !isMediaLikePageUrl(resolverPageUrl)) {
       try {
-        resolvedSeriesContext = await extractSeriesContextFromPage(sourceTabId, resolverPageUrl);
-        if (resolvedSeriesContext) {
-          cacheSeriesContext(resolverPageUrl, resolvedSeriesContext);
+        const liveContext = await extractSeriesContextFromPage(sourceTabId, resolverPageUrl);
+        if (liveContext) {
+          resolvedSeriesContext = cacheSeriesContext(resolverPageUrl, liveContext);
         }
       } catch {
-        resolvedSeriesContext = null;
+        resolvedSeriesContext = getCachedSeriesContext(resolverPageUrl);
       }
     }
   }
@@ -1947,40 +2052,13 @@ async function resolveAndForwardMediaToUi(mediaUrl, pageUrl, seriesContext, sour
     (!Array.isArray(resolvedSeriesContext?.availableQualities) || resolvedSeriesContext.availableQualities.length === 0) &&
     resolvedSeriesContext?.resolver
   ) {
-    const fallbackEpisode = Array.isArray(resolvedSeriesContext.episodes)
-      ? resolvedSeriesContext.episodes[Number(resolvedSeriesContext.currentEpisodeIndex) || 0]
-      : null;
-    const targetEpisode = {
-      seasonId: resolvedSeriesContext.currentSeasonId ?? fallbackEpisode?.seasonId,
-      episodeId: resolvedSeriesContext.currentEpisodeId ?? fallbackEpisode?.episodeId
-    };
-    if (Number.isFinite(Number(targetEpisode.seasonId)) && Number.isFinite(Number(targetEpisode.episodeId))) {
-      const profile = await getParserConfigForUrl(sourcePageUrl || pageUrl);
-      const resolverConfig = findDirectResolverConfig(profile, resolvedSeriesContext);
-      if (resolverConfig) {
-        const resolverOptions = {
-          translatorId: resolvedSeriesContext.selectedTranslatorId,
-          qualityLabel: resolvedSeriesContext.selectedQualityLabel,
-          tabId: sourceTabId
-        };
-        const resolverData = await fetchDirectStreamList(
-          resolverConfig,
-          resolvedSeriesContext,
-          targetEpisode,
-          resolverOptions
-        );
-        const resolverResolution = buildDirectStreamResolution(
-          resolverConfig,
-          resolverData,
-          resolvedSeriesContext,
-          targetEpisode,
-          resolverOptions
-        );
-        if (resolverResolution?.mediaUrl) {
-          resolvedMediaUrl = resolverResolution.mediaUrl;
-          resolvedSeriesContext = resolverResolution.seriesContext;
-        }
-      }
+    const resolution = await resolveMediaFromSeriesContext(resolverPageUrl, resolvedSeriesContext, {
+      translatorId: resolvedSeriesContext.selectedTranslatorId,
+      qualityLabel: resolvedSeriesContext.selectedQualityLabel
+    });
+    if (resolution?.seriesContext) {
+      resolvedSeriesContext = cacheSeriesContext(resolverPageUrl, resolution.seriesContext);
+      sendSeriesContextToUi(targetUiTabId, resolverPageUrl, resolvedSeriesContext);
     }
   }
 
@@ -1990,12 +2068,10 @@ async function resolveAndForwardMediaToUi(mediaUrl, pageUrl, seriesContext, sour
   ) {
     const qualityResolved = await resolveBestQualityHls(mediaUrl);
     if (qualityResolved?.variants?.length) {
-      resolvedMediaUrl = qualityResolved.url || mediaUrl;
-      resolvedMasterPlaylistUrl = qualityResolved.masterUrl || null;
       if (resolvedSeriesContext) {
         resolvedSeriesContext = {
           ...resolvedSeriesContext,
-          masterPlaylistUrl: resolvedMasterPlaylistUrl,
+          masterPlaylistUrl: qualityResolved.masterUrl || mediaUrl,
           availableQualities: qualityResolved.variants.map((variant) => ({
             label: String(variant.label || "").trim(),
             normalizedLabel: String(variant.label || "").toLowerCase().replace(/[^a-z0-9]/g, "")
@@ -2003,36 +2079,16 @@ async function resolveAndForwardMediaToUi(mediaUrl, pageUrl, seriesContext, sour
           selectedQualityLabel:
             resolvedSeriesContext.selectedQualityLabel || pickHighestStreamOption(qualityResolved.variants)?.label || null
         };
+        resolvedSeriesContext = cacheSeriesContext(resolverPageUrl, resolvedSeriesContext);
+        sendSeriesContextToUi(targetUiTabId, resolverPageUrl, resolvedSeriesContext);
       }
     }
   }
 
-  console.log("[Background] Forwarding media from content-script:", {
+  console.log("[Background] Media enrichment completed:", {
     mediaUrl: mediaUrl.substring(0, 100),
     qualities: Array.isArray(resolvedSeriesContext?.availableQualities) ? resolvedSeriesContext.availableQualities.length : 0,
     resolver: resolvedSeriesContext?.resolver?.provider || null
-  });
-  chrome.tabs.query({}, (allTabs) => {
-    if (!allTabs) return;
-    allTabs.filter(t =>
-      t.status === 'complete' &&
-      t.url &&
-      t.url.includes('localhost:3000') &&
-      (!Number.isFinite(targetUiTabId) || t.id === targetUiTabId)
-    )
-      .forEach(tab => {
-        sendTabMessage(tab.id, {
-          type: "WT_MEDIA_FOUND",
-          payload: {
-            roomId: null,
-            mediaUrl: resolvedMediaUrl,
-            masterPlaylistUrl: resolvedMasterPlaylistUrl,
-            pageUrl: pageUrl || mediaUrl,
-            sourcePageUrl: sourcePageUrl || pageUrl || mediaUrl,
-            seriesContext: resolvedSeriesContext
-          }
-        });
-      });
   });
 }
 
@@ -2175,15 +2231,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return;
         }
 
-        sendConfiguredHtmlContextToUi(pageUrl, hostTabId);
-
+        const resolutionOptions = {
+          ...(message.payload.targetEpisode || {}),
+          translatorId: message.payload.selectedTranslatorId ?? null,
+          qualityLabel: message.payload.selectedQualityLabel ?? null
+        };
+        const configuredResolution = resolveConfiguredPageMedia(pageUrl, hostTabId, resolutionOptions).catch(() => null);
         const reuseTabId = await getReusableSearchPopupTabId(pageUrl, hostTabId);
-        const resolved = await resolvePageToMediaOnce(pageUrl, hostTabId, "Opening page", {
+        const popupResolution = resolvePageToMediaOnce(pageUrl, hostTabId, "Opening page", {
           ...(message.payload.targetEpisode || {}),
           seriesContext: message.payload.seriesContext || null,
           selectedTranslatorId: message.payload.selectedTranslatorId ?? null,
           selectedQualityLabel: message.payload.selectedQualityLabel ?? null
         }, reuseTabId);
+        const resolved = await resolveFirstAvailableMedia([configuredResolution, popupResolution]);
         if (!resolved?.mediaUrl) {
           sendError(hostTabId, "No media URL captured");
           sendResponse({ ok: false, error: "No media URL captured" });
@@ -2212,7 +2273,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       for (const [index, resultUrl] of resultUrls.entries()) {
         sendStatus(hostTabId, `Trying candidate ${index + 1}/${resultUrls.length}: ${resultUrl}`);
 
-        const resolved = await resolvePageToMediaOnce(resultUrl, hostTabId, "Opening page", null);
+        const configuredResolution = resolveConfiguredPageMedia(resultUrl, hostTabId).catch(() => null);
+        const popupResolution = resolvePageToMediaOnce(resultUrl, hostTabId, "Opening page", null);
+        const resolved = await resolveFirstAvailableMedia([configuredResolution, popupResolution]);
         if (resolved?.mediaUrl) {
           sendResponse({
             ok: true,
