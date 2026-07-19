@@ -30,7 +30,6 @@ const gestureCommitRetryMs = 60;
 const gestureCommitMaxDelayMs = 650;
 const gestureCommitQuietWindowMs = 90;
 const remoteSeekSettlementGraceMs = 250;
-const seekCorrectionThresholdMs = 100;
 const playbackCorrectionThresholdMs = 300;
 const playbackCorrectionCooldownMs = 1200;
 const playbackStatusIntervalMs = 200;
@@ -100,6 +99,7 @@ const state = {
   hlsRecoveryAttempts: 0,
   hlsMediaErrorAttempts: 0,
   hlsLastRecoveryAt: 0,
+  hlsBufferingPaused: false,
   room: elements.roomInput.value.trim() || "lobby",
   role: elements.roleSelect.value
 };
@@ -624,31 +624,37 @@ function destroyHls() {
     state.hls.destroy();
     state.hls = null;
   }
+  state.hlsBufferingPaused = false;
 }
 
 function pauseStreamBuffering() {
   if (state.hls && typeof state.hls.pauseBuffering === "function") {
     try {
       state.hls.pauseBuffering();
+      state.hlsBufferingPaused = true;
     } catch (error) {
       logEvent("HLS buffering pause failed", error);
     }
   }
 }
 
-function resumeStreamBuffering(startPosition = elements.player.currentTime) {
+function resumeStreamBuffering(startPosition = elements.player.currentTime, forceStartLoad = false) {
   if (!state.hls) {
     return;
   }
 
   try {
-    if (typeof state.hls.resumeBuffering === "function") {
+    const wasPaused = state.hlsBufferingPaused;
+    let resumedWithBufferingApi = false;
+    if (wasPaused && typeof state.hls.resumeBuffering === "function") {
       state.hls.resumeBuffering();
+      resumedWithBufferingApi = true;
     }
 
-    if (typeof state.hls.startLoad === "function") {
+    if ((forceStartLoad || wasPaused && !resumedWithBufferingApi) && typeof state.hls.startLoad === "function") {
       state.hls.startLoad(Number.isFinite(startPosition) ? startPosition : 0);
     }
+    state.hlsBufferingPaused = false;
   } catch (error) {
     logEvent("HLS buffering resume failed", error);
   }
@@ -711,7 +717,7 @@ function attemptStallRecovery(trigger) {
     currentTime: currentTime.toFixed(2)
   });
 
-  resumeStreamBuffering(currentTime);
+  resumeStreamBuffering(currentTime, true);
 
   if (state.hlsRecoveryAttempts >= 3) {
     return rebuildPlaybackPipeline(trigger, currentTime);
@@ -755,7 +761,7 @@ function handleHlsError(event, data) {
       state.hlsMediaErrorAttempts += 1;
       try {
         state.hls.recoverMediaError();
-        resumeStreamBuffering(currentTime);
+        resumeStreamBuffering(currentTime, true);
         state.hlsLastRecoveryAt = Date.now();
         logEvent("HLS media recovery", {
           currentTime: currentTime.toFixed(2),
@@ -1162,16 +1168,15 @@ function reportPlaybackStatus() {
 }
 
 function correctPlaybackDrift(syncEntry, recoveredFromBuffering = false) {
-  const correctionThresholdMs = syncEntry?.reason === "seek"
-    ? seekCorrectionThresholdMs
-    : playbackCorrectionThresholdMs;
   if (
     !syncEntry ||
     (!syncEntry.active && !recoveredFromBuffering) ||
     !Number.isFinite(syncEntry.offsetMs) ||
-    syncEntry.offsetMs <= correctionThresholdMs ||
+    syncEntry.offsetMs <= playbackCorrectionThresholdMs ||
     syncEntry.buffering ||
-    (elements.player.paused && syncEntry.reason !== "seek") ||
+    state.isBuffering ||
+    syncEntry.reason === "seek" ||
+    elements.player.paused ||
     elements.player.seeking ||
     state.seekGestureActive ||
     state.pendingSeekTimer !== null ||

@@ -16,7 +16,6 @@ const playbackSyncDisplayStepMs = 50;
 const playbackSyncActionWindowMs = 1500;
 const playbackSeekRecoveryWindowMs = 15000;
 const seekCommandInitialGraceMs = 700;
-const seekCommandRetryMs = 800;
 
 // Disk persistence variables
 const dataDir = path.join(__dirname, "data");
@@ -418,21 +417,38 @@ function createSeekCommandPayload(room, timestamp = now()) {
   };
 }
 
+function markSeekCommandCompleted(room, socket, actionId) {
+  if (!room?.pendingSeekCommand || room.pendingSeekCommand.actionId !== actionId) return;
+
+  socket.context.completedSeekCommandActionId = actionId;
+  const commandCompletedForAll = Array.from(room.clients).every((client) =>
+    client.context.clientId === room.pendingSeekCommand.originClientId ||
+    client.context.completedSeekCommandActionId === actionId
+  );
+
+  if (commandCompletedForAll) {
+    room.pendingSeekCommand = null;
+    room.lastSeekClientId = null;
+    room.lastSeekAt = 0;
+  }
+}
+
 function retryPendingSeekForClient(room, socket, status, timestamp) {
   const command = createSeekCommandPayload(room, timestamp);
-  if (!command || command.originClientId === socket.context.clientId) return;
-  if (status.buffering || status.applyingSeek) return;
-  if (timestamp - room.pendingSeekCommand.updatedAt < seekCommandInitialGraceMs) return;
-  if (Math.abs(command.currentTime - status.currentTime) <= 0.3) return;
-  if (
-    socket.context.lastSeekCommandActionId === command.actionId &&
-    timestamp - (socket.context.lastSeekCommandAt || 0) < seekCommandRetryMs
-  ) {
+  if (!command) return;
+  if (socket.context.completedSeekCommandActionId === command.actionId) return;
+  const isOrigin = command.originClientId === socket.context.clientId;
+  const reachedTarget = Math.abs(command.currentTime - status.currentTime) <= 0.3;
+  if (reachedTarget && !status.buffering && !status.applyingSeek) {
+    markSeekCommandCompleted(room, socket, command.actionId);
     return;
   }
+  if (isOrigin) return;
+  if (status.buffering || status.applyingSeek) return;
+  if (timestamp - room.pendingSeekCommand.updatedAt < seekCommandInitialGraceMs) return;
+  if (socket.context.lastSeekCommandActionId === command.actionId) return;
 
   socket.context.lastSeekCommandActionId = command.actionId;
-  socket.context.lastSeekCommandAt = timestamp;
   sendJson(socket, command);
 }
 

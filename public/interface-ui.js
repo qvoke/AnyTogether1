@@ -2702,11 +2702,12 @@ function renderParticipants() {
     playbackIcon.textContent = playbackIconKind === "empty" ? "-" : "";
     if (playbackIconKind !== "empty") playbackIcon.innerHTML = createInlineIcon(playbackIconKind);
     status.appendChild(playbackIcon);
+    const isLoading = isParticipantPlaybackLoading(participant);
     const statusText = presenceStatus === "offline"
       ? "Offline"
       : presenceStatus === "not-in-room"
         ? "Not in room"
-        : !hasMedia ? "No media loaded" : `Sync ${syncMs}ms`;
+        : !hasMedia ? "No media loaded" : isLoading ? "Loading" : `Sync ${syncMs}ms`;
     status.appendChild(document.createTextNode(statusText));
     nameRow.appendChild(status);
 
@@ -2774,6 +2775,20 @@ function getParticipantSyncMs(participant) {
   return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
 }
 
+function isParticipantPlaybackLoading(participant) {
+  const playbackState = participant?.clientId
+    ? participantPlaybackStates.get(participant.clientId)
+    : null;
+  if (playbackState === "loading") return true;
+
+  if (typeof window.__getPlaybackSyncInfo === "function" && participant?.clientId) {
+    const syncInfo = window.__getPlaybackSyncInfo(participant.clientId);
+    return Boolean(syncInfo?.buffering);
+  }
+
+  return false;
+}
+
 function refreshParticipantSyncIndicators() {
   const roomState = getActiveRoomState();
   if (!roomState || !participantsList) return;
@@ -2785,6 +2800,7 @@ function refreshParticipantSyncIndicators() {
     if (!participant) return;
 
     const syncMs = getParticipantSyncMs(participant);
+    const isLoading = isParticipantPlaybackLoading(participant);
     const presenceStatus = getParticipantPresenceStatus(participant);
     const syncClass = presenceStatus !== "online"
       ? "pw-dot-muted"
@@ -2800,7 +2816,7 @@ function refreshParticipantSyncIndicators() {
         ? "Offline"
         : presenceStatus === "not-in-room"
           ? "Not in room"
-          : !roomState.currentMedia?.mediaUrl ? "No media loaded" : `Sync ${syncMs}ms`;
+          : !roomState.currentMedia?.mediaUrl ? "No media loaded" : isLoading ? "Loading" : `Sync ${syncMs}ms`;
     }
   });
 }
