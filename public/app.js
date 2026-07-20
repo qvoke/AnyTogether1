@@ -30,12 +30,12 @@ const gestureCommitRetryMs = 60;
 const gestureCommitMaxDelayMs = 650;
 const gestureCommitQuietWindowMs = 90;
 const remoteSeekSettlementGraceMs = 250;
-const playbackCorrectionThresholdMs = 300;
+const seekCorrectionCooldownMs = 800;
 const playbackCorrectionCooldownMs = 1200;
 const playbackStatusIntervalMs = 200;
 const bufferingConfirmationMs = 500;
-const bufferingCorrectionMinimumMs = 700;
 const programmaticSeekLifetimeMs = 10000;
+const programmaticSeekQuietWindowMs = 750;
 const programmaticSeekToleranceSeconds = 0.75;
 
 function getTabClientId() {
@@ -67,8 +67,6 @@ const state = {
   bufferingDetectionTimer: null,
   bufferingSignalActive: false,
   bufferingProbeTime: 0,
-  bufferingStartedAt: 0,
-  lastBufferingDurationMs: 0,
   isConnected: false,
   pendingIntents: [],
   pendingPlaybackState: null,
@@ -87,6 +85,7 @@ const state = {
   remoteSeekSettlementTimer: null,
   remoteApplyTimer: null,
   remoteSeekActivityAt: 0,
+  programmaticSeekClearTimer: null,
   programmaticSeekExpiresAt: 0,
   programmaticSeekTarget: null,
   programmaticPlayEvents: 0,
@@ -300,7 +299,7 @@ function attemptRemoteSeekSettlement(trigger = "seeked") {
   state.remoteSeekActivityAt = Date.now();
   state.pendingSeek = null;
   state.pendingPlaybackState = null;
-  clearProgrammaticSeek();
+  scheduleProgrammaticSeekClear();
 
   logEvent("Remote buffering resumed", {
     trigger,
@@ -416,13 +415,31 @@ function suppressOutgoingEvents(durationMs = 500) {
 }
 
 function clearProgrammaticSeek() {
+  if (state.programmaticSeekClearTimer) {
+    clearTimeout(state.programmaticSeekClearTimer);
+    state.programmaticSeekClearTimer = null;
+  }
   state.programmaticSeekTarget = null;
   state.programmaticSeekExpiresAt = 0;
 }
 
 function markProgrammaticSeek(targetTime) {
+  if (state.programmaticSeekClearTimer) {
+    clearTimeout(state.programmaticSeekClearTimer);
+    state.programmaticSeekClearTimer = null;
+  }
   state.programmaticSeekTarget = Math.max(0, Number.isFinite(targetTime) ? targetTime : 0);
   state.programmaticSeekExpiresAt = performance.now() + programmaticSeekLifetimeMs;
+}
+
+function scheduleProgrammaticSeekClear() {
+  if (state.programmaticSeekTarget === null) return;
+  if (state.programmaticSeekClearTimer) clearTimeout(state.programmaticSeekClearTimer);
+  state.programmaticSeekClearTimer = setTimeout(() => {
+    state.programmaticSeekClearTimer = null;
+    state.programmaticSeekTarget = null;
+    state.programmaticSeekExpiresAt = 0;
+  }, programmaticSeekQuietWindowMs);
 }
 
 function consumeProgrammaticSeekEvent(eventType) {
@@ -440,7 +457,7 @@ function consumeProgrammaticSeekEvent(eventType) {
   }
 
   if (eventType === "seeked") {
-    clearProgrammaticSeek();
+    scheduleProgrammaticSeekClear();
   }
 
   return true;
@@ -1031,7 +1048,6 @@ function applyRemoteState(snapshot) {
 }
 
 function scheduleRemoteSnapshot(snapshot) {
-  // Cancel any pending timer to ensure only the freshest snapshot is applied
   if (state.remoteApplyTimer) {
     clearTimeout(state.remoteApplyTimer);
     state.remoteApplyTimer = null;
@@ -1106,7 +1122,6 @@ function applyGuaranteedRemoteSeek(message) {
 
 function sendMessage(payload) {
   if (!state.connection || state.connection.readyState !== WebSocket.OPEN) {
-    // Queue the message to be sent once WebSocket connects
     state.pendingIntents.push(payload);
     logEvent("Message queued", {
       action: payload.action || payload.type || "unknown"
@@ -1168,16 +1183,26 @@ function reportPlaybackStatus() {
   state.connection.send(JSON.stringify(payload));
 }
 
-function correctPlaybackDrift(syncEntry, recoveredFromBuffering = false) {
+function isPlaybackTimeBuffered(targetTime) {
+  const ranges = elements.player.buffered;
+  for (let index = 0; index < ranges.length; index += 1) {
+    if (targetTime >= ranges.start(index) && targetTime <= ranges.end(index)) return true;
+  }
+  return false;
+}
+
+function correctPlaybackDrift(syncEntry, syncContext = {}) {
+  const isSeekCorrection = syncEntry?.reason === "seek";
+  if (isSeekCorrection) {
+    if (syncContext.referenceClientId === state.clientId || !syncContext.seekActionId) return;
+  }
   if (
     !syncEntry ||
-    (!syncEntry.active && !recoveredFromBuffering) ||
     !Number.isFinite(syncEntry.offsetMs) ||
-    syncEntry.offsetMs <= playbackCorrectionThresholdMs ||
+    syncEntry.offsetMs === 0 ||
     syncEntry.buffering ||
     state.isBuffering ||
-    syncEntry.reason === "seek" ||
-    elements.player.paused ||
+    (elements.player.paused && !isSeekCorrection) ||
     elements.player.seeking ||
     state.seekGestureActive ||
     state.pendingSeekTimer !== null ||
@@ -1187,14 +1212,19 @@ function correctPlaybackDrift(syncEntry, recoveredFromBuffering = false) {
     return;
   }
 
-  const timestamp = performance.now();
-  if (timestamp - state.lastPlaybackCorrectionAt < playbackCorrectionCooldownMs) return;
-
-  state.lastPlaybackCorrectionAt = timestamp;
   const adjustmentMs = Number.isFinite(syncEntry.adjustmentMs)
     ? syncEntry.adjustmentMs
     : syncEntry.offsetMs;
   const correctionTarget = Math.max(0, elements.player.currentTime + adjustmentMs / 1000);
+  if (!isPlaybackTimeBuffered(correctionTarget)) return;
+
+  const timestamp = performance.now();
+  const correctionCooldownMs = isSeekCorrection
+    ? seekCorrectionCooldownMs
+    : playbackCorrectionCooldownMs;
+  if (timestamp - state.lastPlaybackCorrectionAt < correctionCooldownMs) return;
+
+  state.lastPlaybackCorrectionAt = timestamp;
   markProgrammaticSeek(correctionTarget);
   elements.player.currentTime = correctionTarget;
   logEvent("Playback drift corrected", { offsetMs: syncEntry.offsetMs, adjustmentMs });
@@ -1535,18 +1565,16 @@ function connectRoom() {
     }
 
     if (message.type === "playback-sync") {
-      const previousOwnSync = state.playbackSyncOffsets.get(state.clientId);
       state.playbackSyncOffsets = new Map(
         (Array.isArray(message.offsets) ? message.offsets : [])
           .filter((entry) => entry?.clientId)
           .map((entry) => [entry.clientId, entry])
       );
       const ownSync = state.playbackSyncOffsets.get(state.clientId);
-      const recoveredFromBuffering = Boolean(previousOwnSync?.buffering && !ownSync?.buffering);
-      const confirmedBufferingRecovery = recoveredFromBuffering &&
-        state.lastBufferingDurationMs >= bufferingCorrectionMinimumMs;
-      correctPlaybackDrift(ownSync, confirmedBufferingRecovery);
-      if (recoveredFromBuffering) state.lastBufferingDurationMs = 0;
+      correctPlaybackDrift(ownSync, {
+        referenceClientId: message.referenceClientId || null,
+        seekActionId: message.seekActionId || null
+      });
       return;
     }
 
@@ -1870,11 +1898,7 @@ function handlePluginMessage(event) {
 function handleHlsPlayingActivity() {
   state.bufferingSignalActive = false;
   clearBufferingDetectionTimer();
-  if (state.isBuffering && state.bufferingStartedAt > 0) {
-    state.lastBufferingDurationMs = performance.now() - state.bufferingStartedAt;
-  }
   state.isBuffering = false;
-  state.bufferingStartedAt = 0;
   resetHlsRecoveryState();
   void attemptRemoteSeekSettlement("playback-activity");
   void attemptPendingSeekCommit("playback-activity");
@@ -1891,7 +1915,6 @@ function handleWaitingLikeEvent() {
     const currentTime = Number.isFinite(elements.player.currentTime) ? elements.player.currentTime : 0;
     if (currentTime - state.bufferingProbeTime > 0.05) return;
     state.isBuffering = true;
-    state.bufferingStartedAt = performance.now();
     scheduleStallRecovery("waiting");
   }, bufferingConfirmationMs);
 }

@@ -16,8 +16,8 @@ const playbackSyncDisplayStepMs = 50;
 const playbackSyncActionWindowMs = 1500;
 const playbackSeekRecoveryWindowMs = 15000;
 const seekCommandInitialGraceMs = 700;
+const seekCommandStabilityMs = 1000;
 
-// Disk persistence variables
 const dataDir = path.join(__dirname, "data");
 const roomStorePath = path.join(dataDir, "rooms.json");
 const authStorePath = path.join(dataDir, "auth.json");
@@ -367,6 +367,7 @@ function createPlaybackSyncPayload(room) {
     type: "playback-sync",
     roomId: room.roomId,
     referenceClientId,
+    seekActionId: seekCommand?.actionId || null,
     offsets: statuses.map((status) => {
       const rawAdjustmentMs = Math.round((referenceTime - status.currentTime) * 1000);
       const rawOffsetMs = Math.abs(rawAdjustmentMs);
@@ -417,33 +418,50 @@ function createSeekCommandPayload(room, timestamp = now()) {
   };
 }
 
-function markSeekCommandCompleted(room, socket, actionId) {
-  if (!room?.pendingSeekCommand || room.pendingSeekCommand.actionId !== actionId) return;
+function updateSeekCommandStability(context, actionId, reachedTarget, timestamp) {
+  if (context.seekCommandStabilityActionId !== actionId) {
+    context.seekCommandStabilityActionId = actionId;
+    context.seekCommandStableSince = 0;
+  }
 
-  socket.context.completedSeekCommandActionId = actionId;
-  const commandCompletedForAll = Array.from(room.clients).every((client) =>
-    client.context.clientId === room.pendingSeekCommand.originClientId ||
-    client.context.completedSeekCommandActionId === actionId
-  );
+  if (!reachedTarget) {
+    context.seekCommandStableSince = 0;
+  } else if (!context.seekCommandStableSince) {
+    context.seekCommandStableSince = timestamp;
+  }
+}
 
-  if (commandCompletedForAll) {
+function completeSeekCommandWhenStable(room, command, timestamp) {
+  const commandStableForAll = Array.from(room.clients).every((client) => {
+    if (client.context.clientId === command.originClientId) return true;
+    return client.context.seekCommandStabilityActionId === command.actionId &&
+      Number.isFinite(client.context.seekCommandStableSince) &&
+      client.context.seekCommandStableSince > 0 &&
+      timestamp - client.context.seekCommandStableSince >= seekCommandStabilityMs;
+  });
+
+  if (commandStableForAll) {
     room.pendingSeekCommand = null;
     room.lastSeekClientId = null;
     room.lastSeekAt = 0;
   }
+
+  return commandStableForAll;
 }
 
 function retryPendingSeekForClient(room, socket, status, timestamp) {
   const command = createSeekCommandPayload(room, timestamp);
   if (!command) return;
-  if (socket.context.completedSeekCommandActionId === command.actionId) return;
   const isOrigin = command.originClientId === socket.context.clientId;
-  const reachedTarget = Math.abs(command.currentTime - status.currentTime) <= 0.3;
-  if (reachedTarget && !status.buffering && !status.applyingSeek) {
-    markSeekCommandCompleted(room, socket, command.actionId);
-    return;
+  const reachedTarget = Math.abs(command.currentTime - status.currentTime) * 1000 <= playbackSyncToleranceMs &&
+    !status.buffering &&
+    !status.applyingSeek;
+  if (!isOrigin) {
+    updateSeekCommandStability(socket.context, command.actionId, reachedTarget, timestamp);
   }
+  if (completeSeekCommandWhenStable(room, command, timestamp)) return;
   if (isOrigin) return;
+  if (reachedTarget) return;
   if (status.buffering || status.applyingSeek) return;
   if (timestamp - room.pendingSeekCommand.updatedAt < seekCommandInitialGraceMs) return;
   if (socket.context.lastSeekCommandActionId === command.actionId) return;
@@ -452,7 +470,6 @@ function retryPendingSeekForClient(room, socket, status, timestamp) {
   sendJson(socket, command);
 }
 
-// Synced bridges
 function syncRoomPlaybackState(room) {
   if (room.snapshot) {
     room.currentPlayback = {
