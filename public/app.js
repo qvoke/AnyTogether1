@@ -80,6 +80,11 @@ const state = {
   pendingSeekTimer: null,
   pendingSeekObservedSeeked: false,
   pendingSeekRemoteStartedAt: 0,
+  seekDiagnosticSequence: 0,
+  activeSeekDiagnostic: null,
+  seekFragmentRequests: new Map(),
+  seekPlaybackRecoveryTimer: null,
+  seekDecoderRecoveryTimer: null,
   autoplayPending: false,
   remoteSeekPending: false,
   remoteSeekSettlementTimer: null,
@@ -165,6 +170,44 @@ function logEvent(title, detail = "") {
   }));
 }
 
+function beginSeekDiagnostic(source, targetTime) {
+  clearSeekPlaybackRecoveryTimer();
+  state.seekDiagnosticSequence += 1;
+  state.activeSeekDiagnostic = {
+    sequence: state.seekDiagnosticSequence,
+    source,
+    targetTime,
+    startedAt: performance.now()
+  };
+  logEvent(
+    "Seek diagnostic started",
+    `sequence=${state.seekDiagnosticSequence} source=${source} target=${targetTime.toFixed(2)}`
+  );
+}
+
+function getActiveSeekDiagnostic() {
+  const diagnostic = state.activeSeekDiagnostic;
+  if (!diagnostic || performance.now() - diagnostic.startedAt > 20000) return null;
+  return diagnostic;
+}
+
+function getBufferedRangeSummary() {
+  const ranges = [];
+  for (let index = 0; index < elements.player.buffered.length; index += 1) {
+    ranges.push(`${elements.player.buffered.start(index).toFixed(2)}-${elements.player.buffered.end(index).toFixed(2)}`);
+  }
+  return ranges.join(",") || "none";
+}
+
+function logSeekPlaybackMilestone(milestone) {
+  const diagnostic = getActiveSeekDiagnostic();
+  if (!diagnostic) return;
+  logEvent(
+    "Seek playback milestone",
+    `sequence=${diagnostic.sequence} milestone=${milestone} elapsedMs=${Math.round(performance.now() - diagnostic.startedAt)} currentTime=${elements.player.currentTime.toFixed(2)} readyState=${elements.player.readyState} buffered=${getBufferedRangeSummary()}`
+  );
+}
+
 function setConnectionLabel(label) {
   elements.connectionState.textContent = label;
 }
@@ -215,6 +258,76 @@ function clearStallRecoveryTimer() {
     clearTimeout(state.stallRecoveryTimer);
     state.stallRecoveryTimer = null;
   }
+}
+
+function clearSeekPlaybackRecoveryTimer() {
+  if (!state.seekPlaybackRecoveryTimer) return;
+  clearTimeout(state.seekPlaybackRecoveryTimer);
+  state.seekPlaybackRecoveryTimer = null;
+}
+
+function clearSeekDecoderRecoveryTimer() {
+  if (!state.seekDecoderRecoveryTimer) return;
+  clearTimeout(state.seekDecoderRecoveryTimer);
+  state.seekDecoderRecoveryTimer = null;
+}
+
+function scheduleSeekDecoderRecovery(recoveryTarget) {
+  clearSeekDecoderRecoveryTimer();
+  state.seekDecoderRecoveryTimer = setTimeout(() => {
+    state.seekDecoderRecoveryTimer = null;
+    const currentTime = Number.isFinite(elements.player.currentTime) ? elements.player.currentTime : 0;
+    if (
+      !state.hls ||
+      elements.player.paused ||
+      elements.player.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA ||
+      Math.abs(currentTime - recoveryTarget) > programmaticSeekToleranceSeconds ||
+      !isPlaybackTimeBuffered(currentTime)
+    ) {
+      return;
+    }
+
+    markProgrammaticPlaybackChange(true);
+    markProgrammaticPlaybackChange(false);
+    elements.player.pause();
+    void elements.player.play().catch(() => {
+      if (state.programmaticPlayEvents > 0) state.programmaticPlayEvents -= 1;
+    });
+    logEvent("Seek decoder recovery applied", {
+      currentTime: currentTime.toFixed(2),
+      readyState: elements.player.readyState,
+      buffered: getBufferedRangeSummary()
+    });
+  }, 1000);
+}
+
+function scheduleSeekPlaybackRecovery() {
+  if (state.seekPlaybackRecoveryTimer || !state.hls || elements.player.paused) return;
+  const waitingPosition = Number.isFinite(elements.player.currentTime) ? elements.player.currentTime : 0;
+  state.seekPlaybackRecoveryTimer = setTimeout(() => {
+    state.seekPlaybackRecoveryTimer = null;
+    const currentTime = Number.isFinite(elements.player.currentTime) ? elements.player.currentTime : 0;
+    if (
+      !state.hls ||
+      elements.player.paused ||
+      elements.player.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA ||
+      Math.abs(currentTime - waitingPosition) > programmaticSeekToleranceSeconds ||
+      !isPlaybackTimeBuffered(currentTime)
+    ) {
+      return;
+    }
+
+    const recoveryTarget = currentTime + 0.1;
+    markProgrammaticSeek(recoveryTarget);
+    elements.player.currentTime = recoveryTarget;
+    scheduleSeekDecoderRecovery(recoveryTarget);
+    logEvent("Seek playback recovery applied", {
+      currentTime: currentTime.toFixed(2),
+      recoveryTarget: recoveryTarget.toFixed(2),
+      readyState: elements.player.readyState,
+      buffered: getBufferedRangeSummary()
+    });
+  }, 2200);
 }
 
 function clearPendingSeekCommitTimer() {
@@ -635,6 +748,8 @@ async function loadPlayerSource(url, forceReload = false) {
 
 function destroyHls() {
   clearStallRecoveryTimer();
+  clearSeekPlaybackRecoveryTimer();
+  clearSeekDecoderRecoveryTimer();
   clearBufferingDetectionTimer();
   state.bufferingSignalActive = false;
 
@@ -643,6 +758,8 @@ function destroyHls() {
     state.hls = null;
   }
   state.hlsBufferingPaused = false;
+  state.activeSeekDiagnostic = null;
+  state.seekFragmentRequests.clear();
 }
 
 function pauseStreamBuffering() {
@@ -735,6 +852,7 @@ function attemptStallRecovery(trigger) {
     currentTime: currentTime.toFixed(2)
   });
 
+  markProgrammaticSeek(currentTime);
   resumeStreamBuffering(currentTime, true);
 
   if (state.hlsRecoveryAttempts >= 3) {
@@ -759,12 +877,12 @@ function handleHlsError(event, data) {
   const details = data?.details || "unknown";
   const errorMessage = data?.error?.message || data?.err?.message || "";
 
-  logEvent("HLS error", {
-    fatal: Boolean(data?.fatal),
-    type: data?.type || "unknown",
-    details,
-    message: errorMessage
-  });
+  const diagnostic = getActiveSeekDiagnostic();
+  const responseCode = data?.response?.code ?? data?.networkDetails?.status ?? "none";
+  logEvent(
+    "HLS error",
+    `seekSequence=${diagnostic?.sequence ?? "none"} fatal=${Boolean(data?.fatal)} type=${data?.type || "unknown"} details=${details} responseCode=${responseCode} message=${errorMessage || "none"}`
+  );
 
   if (!state.hls) {
     return;
@@ -805,7 +923,12 @@ function handleHlsError(event, data) {
     details === errorDetails.BUFFER_NUDGE_ON_STALL ||
     details === errorDetails.BUFFER_SEEK_OVER_HOLE
   ) {
-    scheduleStallRecovery(String(details));
+    if (
+      details === errorDetails.BUFFER_NUDGE_ON_STALL ||
+      details === errorDetails.BUFFER_SEEK_OVER_HOLE
+    ) {
+      markProgrammaticSeek(currentTime);
+    }
   }
 }
 
@@ -816,6 +939,37 @@ function attachHlsListeners(hls) {
 
   hls.on(window.Hls.Events.ERROR, handleHlsError);
   hls.on(window.Hls.Events.STALL_RESOLVED, handleHlsStallResolved);
+  hls.on(window.Hls.Events.FRAG_LOADING, (event, data) => {
+    const diagnostic = getActiveSeekDiagnostic();
+    if (!diagnostic || !data?.frag) return;
+    state.seekFragmentRequests.set(data.frag, {
+      sequence: diagnostic.sequence,
+      startedAt: performance.now()
+    });
+    logEvent(
+      "Seek fragment loading",
+      `sequence=${diagnostic.sequence} sn=${String(data.frag.sn)} start=${Number(data.frag.start).toFixed(2)} target=${diagnostic.targetTime.toFixed(2)}`
+    );
+  });
+  hls.on(window.Hls.Events.FRAG_LOADED, (event, data) => {
+    const request = data?.frag ? state.seekFragmentRequests.get(data.frag) : null;
+    if (!request) return;
+    request.loadedAt = performance.now();
+    logEvent(
+      "Seek fragment loaded",
+      `sequence=${request.sequence} sn=${String(data.frag.sn)} durationMs=${Math.round(performance.now() - request.startedAt)}`
+    );
+  });
+  hls.on(window.Hls.Events.FRAG_BUFFERED, (event, data) => {
+    const request = data?.frag ? state.seekFragmentRequests.get(data.frag) : null;
+    if (!request) return;
+    state.seekFragmentRequests.delete(data.frag);
+    const bufferedAt = performance.now();
+    logEvent(
+      "Seek fragment buffered",
+      `sequence=${request.sequence} sn=${String(data.frag.sn)} totalMs=${Math.round(bufferedAt - request.startedAt)} appendMs=${request.loadedAt ? Math.round(bufferedAt - request.loadedAt) : "unknown"} readyState=${elements.player.readyState} buffered=${getBufferedRangeSummary()}`
+    );
+  });
 }
 
 function loadSource(url, options = {}) {
@@ -1098,6 +1252,7 @@ function applyGuaranteedRemoteSeek(message) {
   }
 
   state.lastGuaranteedSeekActionId = message.actionId || null;
+  beginSeekDiagnostic("remote", Math.max(0, targetTime));
   clearPendingSeekCommitTimer();
   state.seekGestureActive = false;
   suppressOutgoingEvents(500);
@@ -1336,6 +1491,7 @@ function commitSeek(targetTime, paused = undefined, source = "seek") {
 }
 
 function acknowledgeLocalSeek() {
+  beginSeekDiagnostic("local", Math.max(0, elements.player.currentTime));
   state.seekGestureActive = true;
   pauseStreamBuffering();
   commitSeek(elements.player.currentTime, elements.player.paused, "seeking");
@@ -1896,6 +2052,8 @@ function handlePluginMessage(event) {
 }
 
 function handleHlsPlayingActivity() {
+  clearSeekPlaybackRecoveryTimer();
+  clearSeekDecoderRecoveryTimer();
   state.bufferingSignalActive = false;
   clearBufferingDetectionTimer();
   state.isBuffering = false;
@@ -1906,6 +2064,7 @@ function handleHlsPlayingActivity() {
 
 function handleWaitingLikeEvent() {
   state.bufferingSignalActive = true;
+  scheduleSeekPlaybackRecovery();
   if (state.bufferingDetectionTimer || state.isBuffering) return;
 
   state.bufferingProbeTime = Number.isFinite(elements.player.currentTime) ? elements.player.currentTime : 0;
@@ -1915,7 +2074,7 @@ function handleWaitingLikeEvent() {
     const currentTime = Number.isFinite(elements.player.currentTime) ? elements.player.currentTime : 0;
     if (currentTime - state.bufferingProbeTime > 0.05) return;
     state.isBuffering = true;
-    scheduleStallRecovery("waiting");
+    if (!state.hls) scheduleStallRecovery("waiting");
   }, bufferingConfirmationMs);
 }
 
@@ -2049,18 +2208,27 @@ elements.player.addEventListener("loadedmetadata", () => {
 
 elements.player.addEventListener("loadeddata", () => {
   showMediaPlayer();
+  logSeekPlaybackMilestone("loadeddata");
   handleHlsPlayingActivity();
 });
 elements.player.addEventListener("canplay", () => {
   showMediaPlayer();
+  logSeekPlaybackMilestone("canplay");
   handleHlsPlayingActivity();
 });
 elements.player.addEventListener("playing", () => {
   showMediaPlayer();
+  logSeekPlaybackMilestone("playing");
   handleHlsPlayingActivity();
 });
-elements.player.addEventListener("waiting", handleWaitingLikeEvent);
-elements.player.addEventListener("stalled", handleWaitingLikeEvent);
+elements.player.addEventListener("waiting", () => {
+  logSeekPlaybackMilestone("waiting");
+  handleWaitingLikeEvent();
+});
+elements.player.addEventListener("stalled", () => {
+  logSeekPlaybackMilestone("stalled");
+  handleWaitingLikeEvent();
+});
 
 elements.player.addEventListener("ratechange", () => {
   if (canBroadcastLocalChange()) {
