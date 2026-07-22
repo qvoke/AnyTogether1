@@ -115,6 +115,8 @@ const state = {
   hlsMediaErrorAttempts: 0,
   hlsLastRecoveryAt: 0,
   hlsBufferingPaused: false,
+  activePlayerSourceUrl: "",
+  directMp4FallbackSources: new Set(),
   nativeMediaErrorActive: false,
   nativeMediaErrorRecoveryAttempts: 0,
   nativeMediaErrorRecoveryTimer: null,
@@ -588,6 +590,12 @@ function isHlsSource(url) {
   return /\.m3u8(?:\?|$)/i.test(url);
 }
 
+function getDirectMp4Source(url) {
+  if (typeof url !== "string") return null;
+  const directUrl = url.replace(/\.mp4:hls:manifest\.m3u8(?=\?|$)/i, ".mp4");
+  return directUrl === url ? null : directUrl;
+}
+
 
 function getSourceType(url) {
   if (isHlsSource(url)) {
@@ -672,6 +680,19 @@ async function initializeShakaPlayer() {
 }
 
 async function loadPlayerSource(url, forceReload = false) {
+  const directMp4Url = state.directMp4FallbackSources.has(url)
+    ? null
+    : getDirectMp4Source(url);
+  if (directMp4Url) {
+    state.activePlayerSourceUrl = directMp4Url;
+    elements.player.setAttribute("type", "video/mp4");
+    elements.player.src = directMp4Url;
+    if (forceReload) elements.player.load();
+    logEvent("Direct MP4 source loaded", { sourceUrl: directMp4Url });
+    return;
+  }
+
+  state.activePlayerSourceUrl = url;
   if (isHlsSource(url)) {
     const nativeHlsSupport = elements.player.canPlayType("application/vnd.apple.mpegurl");
     if (nativeHlsSupport) {
@@ -920,6 +941,17 @@ function scheduleNativeMediaErrorRecovery() {
 
 function handleNativeMediaError() {
   if (state.hls || !state.currentMediaUrl) return;
+  const directMp4Url = getDirectMp4Source(state.currentMediaUrl);
+  if (directMp4Url && state.activePlayerSourceUrl === directMp4Url) {
+    state.directMp4FallbackSources.add(state.currentMediaUrl);
+    logEvent("Direct MP4 fallback to HLS", getMediaErrorDetails());
+    rebuildPlaybackPipeline(
+      "direct-mp4-error",
+      elements.player.currentTime,
+      state.desiredPlaybackPaused
+    );
+    return;
+  }
   clearNativeMediaErrorRecoveryResetTimer();
   state.nativeMediaErrorActive = true;
   state.currentMediaReady = false;
@@ -2213,6 +2245,7 @@ function getSeekTestSyncSnapshot() {
 function waitForSeekTestPlayback(targetTime, timeoutMs, expectedParticipantCount) {
   const startedAt = performance.now();
   const events = [];
+  const stabilityTransitions = [];
   const eventNames = ["seeking", "seeked", "waiting", "stalled", "canplay", "playing", "error"];
 
   return new Promise((resolve) => {
@@ -2223,6 +2256,21 @@ function waitForSeekTestPlayback(targetTime, timeoutMs, expectedParticipantCount
     let lastPlaybackAdvanceAt = startedAt;
     let previousMediaTime = elements.player.currentTime;
     let failureReason = "timeout";
+    let stabilityState = null;
+    let maxObservedOffsetMs = 0;
+    const recordStabilityState = (reason, syncOffsets) => {
+      if (reason === stabilityState) return;
+      stabilityState = reason;
+      stabilityTransitions.push({
+        reason,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        currentTime: Number(elements.player.currentTime.toFixed(3)),
+        paused: elements.player.paused,
+        seeking: elements.player.seeking,
+        readyState: elements.player.readyState,
+        syncOffsets
+      });
+    };
     const recordEvent = (event) => {
       const eventRecord = {
         event: event.type,
@@ -2253,7 +2301,9 @@ function waitForSeekTestPlayback(targetTime, timeoutMs, expectedParticipantCount
         networkState: elements.player.networkState,
         buffered: getBufferedRangeSummary(),
         mediaError: getMediaErrorDetails(),
+        maxObservedOffsetMs,
         syncOffsets: getSeekTestSyncSnapshot(),
+        stabilityTransitions,
         events
       });
     };
@@ -2266,6 +2316,11 @@ function waitForSeekTestPlayback(targetTime, timeoutMs, expectedParticipantCount
       previousMediaTime = currentMediaTime;
 
       const syncOffsets = getSeekTestSyncSnapshot();
+      for (const sync of syncOffsets) {
+        if (sync.active && Number.isFinite(sync.offsetMs)) {
+          maxObservedOffsetMs = Math.max(maxObservedOffsetMs, Math.abs(sync.offsetMs));
+        }
+      }
       const participantsReady = syncOffsets.length >= expectedParticipantCount
         && syncOffsets.every((sync) => !sync.buffering && Math.abs(sync.offsetMs) <= 250);
       const reachedTarget = Math.abs(currentMediaTime - targetTime) <= 3;
@@ -2279,6 +2334,7 @@ function waitForSeekTestPlayback(targetTime, timeoutMs, expectedParticipantCount
         stableStartedAt = null;
         stableStartedMediaTime = null;
         failureReason = elements.player.paused ? "paused" : "local-playback-not-ready";
+        recordStabilityState(failureReason, syncOffsets);
         return;
       }
       if (readyAt === null) readyAt = timestamp;
@@ -2286,17 +2342,20 @@ function waitForSeekTestPlayback(targetTime, timeoutMs, expectedParticipantCount
         stableStartedAt = null;
         stableStartedMediaTime = null;
         failureReason = "participants-not-synchronized";
+        recordStabilityState(failureReason, syncOffsets);
         return;
       }
       if (timestamp - lastPlaybackAdvanceAt > 750) {
         stableStartedAt = null;
         stableStartedMediaTime = null;
         failureReason = "playback-not-advancing";
+        recordStabilityState(failureReason, syncOffsets);
         return;
       }
       if (stableStartedAt === null) {
         stableStartedAt = timestamp;
         stableStartedMediaTime = currentMediaTime;
+        recordStabilityState("stable", syncOffsets);
         return;
       }
       const stableElapsedMs = timestamp - stableStartedAt;
@@ -2317,7 +2376,7 @@ function createSeekTestReport(results, requestedIterations, expectedParticipantC
     .map((result) => result.readyLatencyMs)
     .filter(Number.isFinite);
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     mode: seekTestMode,
     room: state.room,
     clientId: state.clientId,

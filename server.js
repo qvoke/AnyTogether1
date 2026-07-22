@@ -429,9 +429,13 @@ function createSeekCommandPayload(room, timestamp = now()) {
     originStatus.mediaReady &&
     !originStatus.buffering &&
     !originStatus.applyingSeek;
-  const currentTime = !command.paused && originReady
-    ? Math.max(command.currentTime, originStatus.currentTime)
+  const previousReferenceTime = Number.isFinite(command.referenceTime)
+    ? command.referenceTime
     : command.currentTime;
+  const currentTime = !command.paused && originReady
+    ? Math.max(previousReferenceTime, originStatus.currentTime)
+    : previousReferenceTime;
+  command.referenceTime = currentTime;
   return {
     type: "seek-command",
     roomId: room.roomId,
@@ -1628,6 +1632,7 @@ function setPendingTimelineCommand(room, context, actionId, snapshot, updatedAt)
   room.pendingSeekCommand = {
     actionId,
     currentTime: snapshot.currentTime,
+    referenceTime: snapshot.currentTime,
     paused: snapshot.paused,
     originClientId: context.clientId,
     updatedAt
