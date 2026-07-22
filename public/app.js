@@ -62,6 +62,7 @@ const state = {
   hasExtension: false,
   currentControl: null,
   currentMediaUrl: "",
+  currentMediaReady: false,
   pendingInterfaceMediaUrl: null,
   lastPlaybackStatusDebugSignature: "",
   lastPresenceDebugSignature: "",
@@ -102,6 +103,7 @@ const state = {
   programmaticSeekTarget: null,
   programmaticPlayEvents: 0,
   programmaticPauseEvents: 0,
+  programmaticPauseExpiresAt: 0,
   seekGestureActive: false,
   stallRecoveryTimer: null,
   suppressOutgoingUntil: 0,
@@ -531,6 +533,7 @@ function consumeProgrammaticSeekEvent(eventType) {
 function markProgrammaticPlaybackChange(paused) {
   if (paused) {
     state.programmaticPauseEvents += 1;
+    state.programmaticPauseExpiresAt = performance.now() + 100;
     return;
   }
 
@@ -539,11 +542,17 @@ function markProgrammaticPlaybackChange(paused) {
 
 function consumeProgrammaticPlaybackEvent(paused) {
   if (paused) {
-    if (state.programmaticPauseEvents <= 0) {
+    if (
+      state.programmaticPauseEvents <= 0 ||
+      performance.now() > state.programmaticPauseExpiresAt
+    ) {
+      state.programmaticPauseEvents = 0;
+      state.programmaticPauseExpiresAt = 0;
       return false;
     }
 
     state.programmaticPauseEvents -= 1;
+    state.programmaticPauseExpiresAt = 0;
     return true;
   }
 
@@ -787,12 +796,14 @@ function rebuildPlaybackPipeline(
   clearProgrammaticSeek();
   state.programmaticPlayEvents = 0;
   state.programmaticPauseEvents = 0;
+  state.programmaticPauseExpiresAt = 0;
   clearRemoteSeekSettlement();
   state.remoteSeekActivityAt = 0;
   clearPendingSeekCommitTimer();
 
   state.pendingSeek = resumePosition;
   state.pendingPlaybackState = pausedBeforeReload;
+  state.currentMediaReady = false;
   void loadPlayerSource(sourceUrl, true);
 
   logEvent("Playback pipeline rebuilt", {
@@ -901,6 +912,7 @@ function handleNativeMediaError() {
   if (state.hls || !state.currentMediaUrl) return;
   clearNativeMediaErrorRecoveryResetTimer();
   state.nativeMediaErrorActive = true;
+  state.currentMediaReady = false;
   state.isBuffering = !state.desiredPlaybackPaused;
   logEvent("Native media error", getMediaErrorDetails());
   scheduleNativeMediaErrorRecovery();
@@ -1027,6 +1039,7 @@ function loadSource(url, options = {}) {
   suppressOutgoingEvents(options.suppressMs ?? 1500);
 
   state.currentMediaUrl = nextUrl;
+  state.currentMediaReady = false;
   state.pendingSeek = null;
   state.pendingPlaybackState = null;
   state.pendingSeekTarget = null;
@@ -1041,7 +1054,9 @@ function loadSource(url, options = {}) {
   clearProgrammaticSeek();
   state.programmaticPlayEvents = 0;
   state.programmaticPauseEvents = 0;
+  state.programmaticPauseExpiresAt = 0;
   clearPendingSeekCommitTimer();
+  applyPlaybackState(true);
 
   showMediaPlayer();
 
@@ -1070,17 +1085,19 @@ function applyPlaybackState(paused) {
     return;
   }
 
-  if (paused === elements.player.paused) {
-    return;
-  }
-
-  markProgrammaticPlaybackChange(paused);
-
   if (paused) {
+    if (!elements.player.paused) {
+      markProgrammaticPlaybackChange(true);
+    }
     elements.player.pause();
     return;
   }
 
+  if (paused === elements.player.paused) {
+    return;
+  }
+
+  markProgrammaticPlaybackChange(false);
   void elements.player.play().catch(() => {
     if (state.programmaticPlayEvents > 0) {
       state.programmaticPlayEvents -= 1;
@@ -1205,6 +1222,10 @@ function applyRemoteState(snapshot) {
 
     if (typeof snapshot.playbackRate === "number") {
       elements.player.playbackRate = snapshot.playbackRate;
+    }
+
+    if (snapshot.paused === true) {
+      applyPlaybackState(true);
     }
 
     const timelineAction = ["load", "play", "pause", "seek"].includes(snapshot.lastAction);
@@ -1360,6 +1381,8 @@ function reportPlaybackStatus() {
     roomId: state.room,
     clientId: state.clientId,
     currentTime: Number.isFinite(elements.player.currentTime) ? elements.player.currentTime : 0,
+    mediaUrl: state.currentMediaUrl,
+    mediaReady: state.currentMediaReady,
     paused: recoveringActivePlayback ? false : elements.player.paused,
     buffering: recoveringActivePlayback || !elements.player.paused && state.isBuffering,
     applyingSeek: state.remoteSeekPending || elements.player.seeking
@@ -1382,6 +1405,29 @@ function reportPlaybackStatus() {
   }
 
   state.connection.send(JSON.stringify(payload));
+}
+
+function setCurrentMediaReadiness(mediaReady) {
+  if (mediaReady === state.currentMediaReady) return;
+  state.currentMediaReady = mediaReady;
+  logEvent("Media readiness changed", {
+    mediaReady,
+    readyState: elements.player.readyState,
+    currentTime: elements.player.currentTime.toFixed(2)
+  });
+  reportPlaybackStatus();
+}
+
+function updateCurrentMediaReadiness() {
+  setCurrentMediaReadiness(Boolean(
+    state.currentMediaUrl &&
+    !elements.player.error &&
+    elements.player.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA
+  ));
+}
+
+function clearCurrentMediaReadiness() {
+  setCurrentMediaReadiness(false);
 }
 
 function isPlaybackTimeBuffered(targetTime) {
@@ -1475,6 +1521,7 @@ function sendPlayerIntent(action, payload = {}, options = {}) {
     actionId,
     roomId: state.room,
     clientId: state.clientId,
+    baseRevision: state.currentRevision,
     ...payload
   };
 
@@ -1728,9 +1775,14 @@ function connectRoom() {
         updateControlState(message.control, "ack");
       }
 
+      if (message.deferredUntilMediaReady) {
+        applyPlaybackState(true);
+      }
+
       logEvent("Intent acknowledged", {
         actionId: message.actionId,
-        revision: message.revision
+        revision: message.revision,
+        deferredUntilMediaReady: Boolean(message.deferredUntilMediaReady)
       });
       return;
     }
@@ -2042,7 +2094,7 @@ function loadManualMedia() {
   });
 
   state.pendingSeek = 0;
-  state.pendingPlaybackState = wasPaused;
+  state.pendingPlaybackState = true;
 
   logEvent("Manual media queued", {
     sourceUrl: url,
@@ -2088,7 +2140,7 @@ function handlePluginMessage(event) {
     });
 
     state.pendingSeek = 0;
-    state.pendingPlaybackState = wasPaused;
+    state.pendingPlaybackState = true;
 
     logEvent("Plugin media result", {
       originUrl: originUrl || mediaUrl,
@@ -2425,9 +2477,16 @@ elements.seekButton.addEventListener("click", () => {
 elements.syncButton.addEventListener("click", () => sendMessage({ type: "request-sync" }));
 
 elements.player.addEventListener("play", () => {
-  state.desiredPlaybackPaused = false;
+  const shouldRemainPaused = state.desiredPlaybackPaused;
   showMediaPlayer();
   const isProgrammaticPlay = consumeProgrammaticPlaybackEvent(false);
+  if (shouldRemainPaused && isProgrammaticPlay) {
+    applyPlaybackState(true);
+    setPlaybackState();
+    return;
+  }
+
+  state.desiredPlaybackPaused = false;
   logEvent("Player play event", {
     clientId: state.clientId,
     programmatic: isProgrammaticPlay,
@@ -2470,8 +2529,10 @@ elements.player.addEventListener("pause", () => {
     return;
   }
 
+  const pauseWasAlreadyRequested = state.desiredPlaybackPaused;
   state.desiredPlaybackPaused = true;
-  const isProgrammaticPause = consumeProgrammaticPlaybackEvent(true);
+  consumeProgrammaticPlaybackEvent(true);
+  const isProgrammaticPause = pauseWasAlreadyRequested;
   logEvent("Player pause event", {
     clientId: state.clientId,
     programmatic: isProgrammaticPause,
@@ -2549,15 +2610,20 @@ elements.player.addEventListener("loadedmetadata", () => {
   setPlaybackState();
 });
 
+elements.player.addEventListener("loadstart", clearCurrentMediaReadiness);
+elements.player.addEventListener("emptied", clearCurrentMediaReadiness);
+
 elements.player.addEventListener("loadeddata", () => {
   showMediaPlayer();
   logSeekPlaybackMilestone("loadeddata");
   markNativeMediaRecovered();
+  updateCurrentMediaReadiness();
   handleHlsPlayingActivity();
 });
 elements.player.addEventListener("canplay", () => {
   showMediaPlayer();
   logSeekPlaybackMilestone("canplay");
+  updateCurrentMediaReadiness();
   handleHlsPlayingActivity();
 });
 elements.player.addEventListener("playing", () => {
@@ -2565,10 +2631,12 @@ elements.player.addEventListener("playing", () => {
   showMediaPlayer();
   logSeekPlaybackMilestone("playing");
   markNativeMediaRecovered();
+  updateCurrentMediaReadiness();
   handleHlsPlayingActivity();
 });
 elements.player.addEventListener("error", handleNativeMediaError);
 elements.player.addEventListener("waiting", () => {
+  clearCurrentMediaReadiness();
   logSeekPlaybackMilestone("waiting");
   handleWaitingLikeEvent();
 });

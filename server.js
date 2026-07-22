@@ -83,7 +83,6 @@ function normalizeDisplayName(value) {
   return displayName || "Guest";
 }
 
-// Password hashing & session logic
 function createPasswordRecord(password, salt = null) {
   const passwordSalt = salt || crypto.randomBytes(16).toString("hex");
   const passwordHash = pbkdf2Sync(String(password || ""), passwordSalt, 120000, 64, "sha512").toString("hex");
@@ -126,6 +125,7 @@ function createRoom(roomId, title = null, ownerId = null) {
 
     revision: 0,
     snapshot: null,
+    pendingPlayIntent: null,
     clients: new Set(),
     control: {
       clientId: null,
@@ -229,11 +229,9 @@ function serializeSnapshot(room) {
 
 function sendJson(responseOrSocket, statusCodeOrPayload, payloadIfResponse = null) {
   if (typeof responseOrSocket.writeHead === "function") {
-    // It's an HTTP response
     responseOrSocket.writeHead(statusCodeOrPayload, { "Content-Type": "application/json; charset=utf-8" });
     responseOrSocket.end(JSON.stringify(payloadIfResponse));
   } else {
-    // It's a WebSocket
     if (responseOrSocket.readyState === 1) {
       responseOrSocket.send(JSON.stringify(statusCodeOrPayload));
     }
@@ -260,11 +258,17 @@ function createRoomStatePayload(room) {
 }
 
 function getClientPlaybackState(room, context) {
-  if (room.currentPlayback?.state === "paused") return "paused";
-
   const playbackStatus = context?.playbackStatus;
+  const roomMediaUrl = room.snapshot?.mediaUrl || "";
+  if (
+    roomMediaUrl &&
+    (!playbackStatus || playbackStatus.mediaUrl !== roomMediaUrl || !playbackStatus.mediaReady)
+  ) {
+    return "loading";
+  }
+  if (playbackStatus?.buffering || playbackStatus?.applyingSeek) return "loading";
+  if (room.currentPlayback?.state === "paused") return "paused";
   if (!playbackStatus || playbackStatus.paused) return "paused";
-  if (playbackStatus.buffering || playbackStatus.applyingSeek) return "loading";
   return "playing";
 }
 
@@ -311,7 +315,9 @@ function projectPlaybackStatus(status, timestamp) {
     currentTime: Math.max(0, status.currentTime + elapsedSeconds),
     paused: status.paused,
     buffering: status.buffering,
-    applyingSeek: status.applyingSeek
+    applyingSeek: status.applyingSeek,
+    mediaUrl: status.mediaUrl || "",
+    mediaReady: Boolean(status.mediaReady)
   };
 }
 
@@ -492,7 +498,24 @@ function syncRoomPlaybackState(room) {
   }
 }
 
+function resetRoomClientMediaReadiness(room) {
+  for (const client of room.clients) {
+    if (client.context?.playbackStatus) {
+      client.context.playbackStatus.mediaReady = false;
+    }
+  }
+}
+
+function resetRoomMediaLoadState(room) {
+  room.pendingSeekCommand = null;
+  room.pendingPlayIntent = null;
+  room.lastSeekClientId = null;
+  room.lastSeekAt = 0;
+  resetRoomClientMediaReadiness(room);
+}
+
 function syncRoomSnapshotFromUI(room, mediaUrl, paused = true, time = 0) {
+  resetRoomMediaLoadState(room);
   room.snapshot = room.snapshot || {
     mediaUrl: "",
     currentTime: 0,
@@ -545,7 +568,6 @@ function broadcastRoomsList() {
   });
 }
 
-// Disk persistence logic
 function roomToPersistable(room) {
   return {
     code: room.code,
@@ -627,7 +649,6 @@ function normalizePersistedRoom(roomData) {
 
   room.lastUpdatedAt = Number.isFinite(roomData?.lastUpdatedAt) ? roomData.lastUpdatedAt : room.createdAt;
 
-  // Initialize playback snapshot based on currentMedia and currentPlayback:
   room.snapshot = {
     mediaUrl: room.currentMedia?.mediaUrl || "",
     currentTime: room.currentPlayback?.time || 0,
@@ -751,7 +772,6 @@ async function loadAuthFromDisk() {
   }
 }
 
-// User fetch helpers
 function getUserById(userId) {
   const normalized = String(userId || "").trim();
   if (!normalized) return null;
@@ -1225,7 +1245,6 @@ function normalizeRoomTitle(value) {
   return title || null;
 }
 
-// WS joining/leaving for Connection 2 UI sockets
 function joinRoom(roomCode, socket, { nickname, clientId, canManageContent, hasExtension }) {
   const normalized = normalizeRoomCode(roomCode);
   if (!normalized) return;
@@ -1348,7 +1367,6 @@ function detachSocketFromRooms(socket) {
   state.presenceRooms.clear();
 }
 
-// REST API Request handler
 async function readBody(request) {
   return new Promise((resolve) => {
     let body = "";
@@ -1369,7 +1387,6 @@ async function handleApiRequest(request, response, url) {
   const method = request.method;
   const pathPart = url.pathname;
 
-  // POST /api/auth/register
   if (method === "POST" && (pathPart === "/api/auth/register" || pathPart === "/api/auth/signup")) {
     const { displayName, email, password } = await readBody(request);
     try {
@@ -1386,7 +1403,6 @@ async function handleApiRequest(request, response, url) {
     return true;
   }
 
-  // POST /api/auth/login
   if (method === "POST" && pathPart === "/api/auth/login") {
     const { identifier, password } = await readBody(request);
     const user = authenticateUser(identifier, password);
@@ -1399,7 +1415,6 @@ async function handleApiRequest(request, response, url) {
     return true;
   }
 
-  // POST /api/auth/logout
   if (method === "POST" && pathPart === "/api/auth/logout") {
     const session = getSessionFromRequest(request);
     if (session) {
@@ -1409,7 +1424,6 @@ async function handleApiRequest(request, response, url) {
     return true;
   }
 
-  // GET /api/auth/me
   if (method === "GET" && pathPart === "/api/auth/me") {
     const user = getUserFromRequest(request);
     if (!user) {
@@ -1420,7 +1434,6 @@ async function handleApiRequest(request, response, url) {
     return true;
   }
 
-  // GET /api/me/rooms
   if (method === "GET" && pathPart === "/api/me/rooms") {
     const user = getUserFromRequest(request);
     if (!user) {
@@ -1432,7 +1445,6 @@ async function handleApiRequest(request, response, url) {
     return true;
   }
 
-  // GET /api/rooms
   if (method === "GET" && pathPart === "/api/rooms") {
     const summaries = [...rooms.values()]
       .map((room) => buildRoomSummary(room))
@@ -1441,7 +1453,6 @@ async function handleApiRequest(request, response, url) {
     return true;
   }
 
-  // POST /api/rooms
   if (method === "POST" && pathPart === "/api/rooms") {
     const user = getUserFromRequest(request);
     const { title } = await readBody(request);
@@ -1459,7 +1470,6 @@ async function handleApiRequest(request, response, url) {
     return true;
   }
 
-  // GET /api/rooms/:roomId
   if (method === "GET" && pathPart.startsWith("/api/rooms/")) {
     const roomCode = normalizeRoomCode(pathPart.split("/").pop());
     const room = rooms.get(roomCode);
@@ -1471,7 +1481,6 @@ async function handleApiRequest(request, response, url) {
     return true;
   }
 
-  // DELETE /api/rooms/:roomId
   if (method === "DELETE" && pathPart.startsWith("/api/rooms/")) {
     const roomCode = normalizeRoomCode(pathPart.split("/").pop());
     const room = rooms.get(roomCode);
@@ -1492,7 +1501,6 @@ async function handleApiRequest(request, response, url) {
       detachRoomFromUser(user.id, roomCode);
     }
 
-    // Broadcast to UI sockets that room is deleted
     broadcastToUiSockets(getRoomMembers(roomCode), {
       type: "room:deleted",
       roomId: roomCode
@@ -1549,6 +1557,55 @@ function clampCurrentTime(value) {
   return Math.max(0, value);
 }
 
+function isRoomMediaReady(room, timestamp = now()) {
+  const mediaUrl = room.snapshot?.mediaUrl || "";
+  if (!mediaUrl || room.clients.size === 0) return false;
+  return Array.from(room.clients).every((client) => {
+    const status = client.context?.playbackStatus;
+    return status?.mediaUrl === mediaUrl &&
+      status.mediaReady === true &&
+      timestamp - status.receivedAt <= playbackStatusMaxAgeMs;
+  });
+}
+
+function queuePendingRoomPlay(room, context, message, actionId, requestedAt) {
+  room.pendingPlayIntent = {
+    actionId,
+    originClientId: context.clientId,
+    currentTime: clampCurrentTime(message.currentTime),
+    playbackRate: message.playbackRate,
+    volume: message.volume,
+    muted: message.muted,
+    requestedAt
+  };
+}
+
+function releasePendingRoomPlay(room, timestamp = now()) {
+  const pending = room.pendingPlayIntent;
+  if (!pending || !isRoomMediaReady(room, timestamp)) return false;
+  const originSocket = Array.from(room.clients).find(
+    (client) => client.context?.clientId === pending.originClientId
+  );
+  const context = originSocket?.context || Array.from(room.clients)[0]?.context;
+  if (!context) return false;
+
+  room.pendingPlayIntent = null;
+  const result = applyPlayerIntent(room, context, {
+    action: "play",
+    actionId: pending.actionId,
+    currentTime: pending.currentTime,
+    playbackRate: pending.playbackRate,
+    volume: pending.volume,
+    muted: pending.muted,
+    mediaReadyRelease: true
+  }, timestamp);
+  if (!result.accepted) return false;
+  broadcast(room, createRoomStatePayload(room));
+  broadcast(room, createPresencePayload(room));
+  broadcastPlaybackSync(room);
+  return true;
+}
+
 function setPendingTimelineCommand(room, context, actionId, snapshot, updatedAt) {
   room.pendingSeekCommand = {
     actionId,
@@ -1562,11 +1619,41 @@ function setPendingTimelineCommand(room, context, actionId, snapshot, updatedAt)
 function applyPlayerIntent(room, context, message, nowVal) {
   const action = typeof message.action === "string" ? message.action : "";
   const actionId = typeof message.actionId === "string" && message.actionId ? message.actionId : crypto.randomUUID();
+  let resumeAfterMediaReady = false;
 
   if (!["load", "play", "pause", "seek", "ratechange", "volumechange"].includes(action)) {
     return {
       accepted: false,
       reason: "unknown-action",
+      actionId
+    };
+  }
+
+  if (
+    action === "play" &&
+    room.snapshot?.paused === true &&
+    room.snapshot.lastAction === "pause" &&
+    Number.isFinite(message.baseRevision) &&
+    message.baseRevision < room.revision &&
+    room.control.clientId !== context.clientId
+  ) {
+    return {
+      accepted: false,
+      reason: "stale-play-intent",
+      actionId
+    };
+  }
+
+  if (
+    action === "play" &&
+    message.mediaReadyRelease !== true &&
+    room.snapshot?.mediaUrl &&
+    !isRoomMediaReady(room, nowVal)
+  ) {
+    queuePendingRoomPlay(room, context, message, actionId, nowVal);
+    return {
+      accepted: true,
+      deferredUntilMediaReady: true,
       actionId
     };
   }
@@ -1595,6 +1682,11 @@ function applyPlayerIntent(room, context, message, nowVal) {
         currentTime: next.currentTime,
         paused: next.paused,
         buffering: false,
+        applyingSeek: false,
+        mediaUrl: next.mediaUrl || "",
+        mediaReady: Boolean(
+          context.playbackStatus?.mediaReady && context.playbackStatus?.mediaUrl === next.mediaUrl
+        ),
         receivedAt: nowVal
       };
       room._lastSeekAt = nowVal;
@@ -1631,9 +1723,8 @@ function applyPlayerIntent(room, context, message, nowVal) {
   };
 
   if (action === "load") {
-    room.pendingSeekCommand = null;
-    room.lastSeekClientId = null;
-    room.lastSeekAt = 0;
+    resetRoomMediaLoadState(room);
+    resumeAfterMediaReady = message.paused === false;
 
     if (typeof message.mediaUrl === "string" && message.mediaUrl.trim()) {
       next.mediaUrl = message.mediaUrl.trim();
@@ -1643,9 +1734,7 @@ function applyPlayerIntent(room, context, message, nowVal) {
       typeof message.currentTime === "number" && Number.isFinite(message.currentTime) ? message.currentTime : 0
     );
 
-    if (typeof message.paused === "boolean") {
-      next.paused = message.paused;
-    }
+    next.paused = true;
   }
 
   if (typeof message.currentTime === "number" && Number.isFinite(message.currentTime)) {
@@ -1674,9 +1763,11 @@ function applyPlayerIntent(room, context, message, nowVal) {
 
   if (action === "pause") {
     next.paused = true;
+    room.pendingPlayIntent = null;
   }
 
   if (action === "play" || action === "pause") {
+    room.pendingSeekCommand = null;
     room.lastSeekClientId = null;
     room.lastSeekAt = 0;
   }
@@ -1686,7 +1777,7 @@ function applyPlayerIntent(room, context, message, nowVal) {
     room.lastSeekAt = nowVal;
   }
 
-  if (["seek", "play", "pause"].includes(action)) {
+  if (action === "seek") {
     setPendingTimelineCommand(room, context, actionId, next, nowVal);
   }
 
@@ -1695,6 +1786,11 @@ function applyPlayerIntent(room, context, message, nowVal) {
     currentTime: next.currentTime,
     paused: next.paused,
     buffering: false,
+    applyingSeek: false,
+    mediaUrl: next.mediaUrl || "",
+    mediaReady: action === "load"
+      ? false
+      : Boolean(context.playbackStatus?.mediaReady && context.playbackStatus?.mediaUrl === next.mediaUrl),
     receivedAt: nowVal
   };
 
@@ -1716,12 +1812,22 @@ function applyPlayerIntent(room, context, message, nowVal) {
     control: serializeControl(room)
   };
 
+  if (action === "load" && resumeAfterMediaReady) {
+    queuePendingRoomPlay(room, context, {
+      currentTime: next.currentTime,
+      playbackRate: next.playbackRate,
+      volume: next.volume,
+      muted: next.muted
+    }, crypto.randomUUID(), nowVal);
+  }
+
   syncRoomPlaybackState(room);
   broadcastRoomSnapshot(room.code);
   schedulePersist();
 
   return {
     accepted: true,
+    deferredUntilMediaReady: action === "load" && resumeAfterMediaReady,
     actionId
   };
 }
@@ -1823,16 +1929,21 @@ wss.on("connection", (socket, request) => {
       if (message.type === "playback-status") {
         const statusTimestamp = now();
         const previousPlaybackState = getClientPlaybackState(room, socket.context);
+        const mediaUrl = typeof message.mediaUrl === "string" ? message.mediaUrl : "";
+        const mediaReady = message.mediaReady === true;
         socket.context.playbackStatus = {
           clientId: socket.context.clientId,
           currentTime: clampCurrentTime(message.currentTime),
           paused: Boolean(message.paused),
           buffering: Boolean(message.buffering),
           applyingSeek: Boolean(message.applyingSeek),
+          mediaUrl,
+          mediaReady,
           receivedAt: statusTimestamp
         };
 
         retryPendingSeekForClient(room, socket, socket.context.playbackStatus, statusTimestamp);
+        releasePendingRoomPlay(room, statusTimestamp);
         if (getClientPlaybackState(room, socket.context) !== previousPlaybackState) {
           broadcast(room, createPresencePayload(room));
         }
@@ -1872,7 +1983,8 @@ wss.on("connection", (socket, request) => {
           roomId,
           actionId: result.actionId,
           revision: room.revision,
-          control: serializeControl(room)
+          control: serializeControl(room),
+          deferredUntilMediaReady: result.deferredUntilMediaReady === true
         });
 
         broadcast(room, createPresencePayload(room));
@@ -1934,6 +2046,7 @@ wss.on("connection", (socket, request) => {
       }
 
       refreshRoomSnapshotFromPlayback(room);
+      releasePendingRoomPlay(room);
       broadcastRoomSnapshot(room.roomId);
 
       if (deleteRoomIfOrphaned(roomId)) {
@@ -2213,7 +2326,6 @@ wss.on("connection", (socket, request) => {
         room.chat.push(chatMessage);
         markRoomUpdated(roomId);
 
-        // Broadcast to Connection 2 sockets
         broadcastToUiSockets(getRoomMembers(roomId), {
           type: "chat:message",
           roomId,
@@ -2415,7 +2527,6 @@ server.on("error", (error) => {
   throw error;
 });
 
-// Initialization
 async function startServer() {
   await loadRoomsFromDisk();
   await loadAuthFromDisk();
