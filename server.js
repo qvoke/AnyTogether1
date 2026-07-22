@@ -356,12 +356,16 @@ function createPlaybackSyncPayload(room) {
   const seekCommand = createSeekCommandPayload(room, timestamp);
   let referenceClientId = seekCommand?.originClientId || null;
   let referenceTime = seekCommand?.currentTime ?? null;
+  let referenceStatus = referenceClientId
+    ? statuses.find((status) => status.clientId === referenceClientId) || null
+    : null;
   if (referenceTime === null && statuses.length > 0) {
     const reference = statuses.reduce((latest, status) =>
       status.currentTime > latest.currentTime ? status : latest
     );
     referenceClientId = reference.clientId;
     referenceTime = reference.currentTime;
+    referenceStatus = reference;
   }
 
   referenceTime ??= 0;
@@ -373,6 +377,10 @@ function createPlaybackSyncPayload(room) {
     type: "playback-sync",
     roomId: room.roomId,
     referenceClientId,
+    referenceBuffering: Boolean(
+      referenceStatus &&
+      (referenceStatus.buffering || referenceStatus.applyingSeek || !referenceStatus.mediaReady)
+    ),
     seekActionId: seekCommand?.actionId || null,
     offsets: statuses.map((status) => {
       const rawAdjustmentMs = Math.round((referenceTime - status.currentTime) * 1000);
@@ -413,12 +421,22 @@ function createSeekCommandPayload(room, timestamp = now()) {
   const command = room.pendingSeekCommand;
   if (!command || timestamp - command.updatedAt > playbackSeekRecoveryWindowMs) return null;
 
-  const elapsedSeconds = command.paused ? 0 : Math.max(0, timestamp - command.updatedAt) / 1000;
+  const originClient = Array.from(room.clients).find(
+    (client) => client.context?.clientId === command.originClientId
+  );
+  const originStatus = projectPlaybackStatus(originClient?.context?.playbackStatus, timestamp);
+  const originReady = originStatus &&
+    originStatus.mediaReady &&
+    !originStatus.buffering &&
+    !originStatus.applyingSeek;
+  const currentTime = !command.paused && originReady
+    ? Math.max(command.currentTime, originStatus.currentTime)
+    : command.currentTime;
   return {
     type: "seek-command",
     roomId: room.roomId,
     actionId: command.actionId,
-    currentTime: command.currentTime + elapsedSeconds,
+    currentTime,
     paused: command.paused,
     originClientId: command.originClientId
   };
@@ -1682,7 +1700,7 @@ function applyPlayerIntent(room, context, message, nowVal) {
         currentTime: next.currentTime,
         paused: next.paused,
         buffering: false,
-        applyingSeek: false,
+        applyingSeek: true,
         mediaUrl: next.mediaUrl || "",
         mediaReady: Boolean(
           context.playbackStatus?.mediaReady && context.playbackStatus?.mediaUrl === next.mediaUrl
@@ -1786,7 +1804,7 @@ function applyPlayerIntent(room, context, message, nowVal) {
     currentTime: next.currentTime,
     paused: next.paused,
     buffering: false,
-    applyingSeek: false,
+    applyingSeek: action === "seek",
     mediaUrl: next.mediaUrl || "",
     mediaReady: action === "load"
       ? false

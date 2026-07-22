@@ -34,6 +34,7 @@ const seekCorrectionCooldownMs = 800;
 const playbackCorrectionCooldownMs = 1200;
 const playbackStatusIntervalMs = 200;
 const bufferingConfirmationMs = 500;
+const nativeStallRecoveryDelayMs = 6000;
 const programmaticSeekLifetimeMs = 10000;
 const programmaticSeekQuietWindowMs = 750;
 const programmaticSeekToleranceSeconds = 0.75;
@@ -118,6 +119,8 @@ const state = {
   nativeMediaErrorRecoveryAttempts: 0,
   nativeMediaErrorRecoveryTimer: null,
   nativeMediaErrorRecoveryResetTimer: null,
+  lastNativeStallRecoveryAt: 0,
+  lastNativeStallRecoveryPosition: null,
   desiredPlaybackPaused: true,
   room: elements.roomInput.value.trim() || "lobby",
   role: elements.roleSelect.value
@@ -823,6 +826,13 @@ function attemptStallRecovery(trigger) {
 
   const currentTime = Number.isFinite(elements.player.currentTime) ? elements.player.currentTime : 0;
   if (!state.hls) {
+    const timestamp = Date.now();
+    const repeatedRecovery = timestamp - state.lastNativeStallRecoveryAt < 15000 &&
+      Number.isFinite(state.lastNativeStallRecoveryPosition) &&
+      Math.abs(currentTime - state.lastNativeStallRecoveryPosition) < 6;
+    if (repeatedRecovery) return false;
+    state.lastNativeStallRecoveryAt = timestamp;
+    state.lastNativeStallRecoveryPosition = currentTime;
     logEvent("Native playback stall recovery", {
       trigger,
       currentTime: currentTime.toFixed(2)
@@ -858,7 +868,7 @@ function scheduleStallRecovery(trigger) {
   state.stallRecoveryTimer = setTimeout(() => {
     state.stallRecoveryTimer = null;
     attemptStallRecovery(trigger);
-  }, 2500);
+  }, nativeStallRecoveryDelayMs);
 }
 
 function getMediaErrorDetails() {
@@ -1047,6 +1057,8 @@ function loadSource(url, options = {}) {
   state.isBuffering = false;
   state.nativeMediaErrorActive = false;
   state.nativeMediaErrorRecoveryAttempts = 0;
+  state.lastNativeStallRecoveryAt = 0;
+  state.lastNativeStallRecoveryPosition = null;
   clearRemoteSeekSettlement();
   state.remoteSeekActivityAt = 0;
   state.pendingSeekCommitStartedAt = 0;
@@ -1440,6 +1452,7 @@ function isPlaybackTimeBuffered(targetTime) {
 
 function correctPlaybackDrift(syncEntry, syncContext = {}) {
   if (seekTestDisables("corrections")) return;
+  if (syncContext.referenceBuffering) return;
   const isSeekCorrection = syncEntry?.reason === "seek";
   if (isSeekCorrection) {
     if (syncContext.referenceClientId === state.clientId || !syncContext.seekActionId) return;
@@ -1834,7 +1847,8 @@ function connectRoom() {
       const ownSync = state.playbackSyncOffsets.get(state.clientId);
       correctPlaybackDrift(ownSync, {
         referenceClientId: message.referenceClientId || null,
-        seekActionId: message.seekActionId || null
+        seekActionId: message.seekActionId || null,
+        referenceBuffering: message.referenceBuffering === true
       });
       return;
     }
