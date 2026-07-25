@@ -44,6 +44,8 @@ const seekTestEnabled = seekTestParams.get("seekTest") === "1";
 const seekTestMode = seekTestParams.get("seekTestMode") || "full";
 const playerTransportMode = seekTestParams.get("playerTransport") || "auto";
 const seekTestPassiveClient = seekTestParams.get("seekTestPassiveClient") === "1";
+const seekTestFastSeek = seekTestParams.get("seekTestFastSeek") === "1";
+const seekTestAlignToFragment = seekTestParams.get("seekTestAlignToFragment") === "1";
 const requestedSeekTestStableMs = Number(seekTestParams.get("seekTestStableMs"));
 const seekTestStableWindowMs = Number.isFinite(requestedSeekTestStableMs)
   ? Math.min(30000, Math.max(1000, requestedSeekTestStableMs))
@@ -71,6 +73,32 @@ function seekTestIgnoresParticipantOffset() {
 
 function seekTestContinuesAfterTimeout() {
   return seekTestMode === "standalone" || seekTestIgnoresParticipantOffset();
+}
+
+function setPlayerCurrentTime(targetTime) {
+  if (seekTestFastSeek && typeof elements.player.fastSeek === "function") {
+    elements.player.fastSeek(targetTime);
+    return;
+  }
+
+  elements.player.currentTime = targetTime;
+}
+
+function getFragmentAlignedSeekTime(targetTime) {
+  if (!seekTestAlignToFragment || !state.hls) {
+    return targetTime;
+  }
+
+  const selectedLevel = state.hls.currentLevel >= 0
+    ? state.hls.levels[state.hls.currentLevel]
+    : state.hls.levels[0];
+  const fragments = selectedLevel?.details?.fragments;
+  const fragment = fragments?.find((candidate) => (
+    targetTime >= candidate.start
+    && targetTime < candidate.start + candidate.duration
+  ));
+
+  return fragment ? fragment.start + 0.05 : targetTime;
 }
 
 function getTabClientId() {
@@ -373,7 +401,7 @@ function attemptRemoteSeekSettlement(trigger = "seeked") {
       state.pendingSeekObservedSeeked = false;
       state.pendingSeekRemoteStartedAt = now;
       markProgrammaticSeek(targetTime);
-      elements.player.currentTime = targetTime;
+      setPlayerCurrentTime(targetTime);
       scheduleRemoteSeekSettlementAttempt();
       return false;
     }
@@ -1339,7 +1367,7 @@ function applyRemoteState(snapshot) {
 
         if (elements.player.readyState >= 1) {
           markProgrammaticSeek(currentTime);
-          elements.player.currentTime = currentTime;
+          setPlayerCurrentTime(currentTime);
           state.pendingSeek = null;
         } else {
           state.pendingSeek = currentTime;
@@ -2436,7 +2464,7 @@ function waitForSeekTestPlayback(targetTime, timeoutMs, expectedParticipantCount
       }
     }, 50);
     const timeoutTimer = setTimeout(() => finish(true), timeoutMs);
-    elements.player.currentTime = targetTime;
+    setPlayerCurrentTime(targetTime);
   });
 }
 
@@ -2456,6 +2484,9 @@ function createSeekTestReport(results, requestedIterations, expectedParticipantC
     transport: state.hls ? "hls.js" : "native",
     playerTransportMode,
     passiveClient: seekTestPassiveClient,
+    fastSeekRequested: seekTestFastSeek,
+    fastSeekSupported: typeof elements.player.fastSeek === "function",
+    fragmentAlignmentRequested: seekTestAlignToFragment,
     stableWindowMs: seekTestStableWindowMs,
     duration: Number(elements.player.duration.toFixed(3)),
     startedAt,
@@ -2546,7 +2577,21 @@ async function runSeekStressTest(iterations = 20) {
   if (startButton) startButton.disabled = true;
   if (copyButton) copyButton.disabled = true;
 
-  await elements.player.play();
+  let playbackStarted = false;
+  let lastPlaybackError = null;
+  for (let attempt = 0; attempt < 12 && !playbackStarted; attempt += 1) {
+    try {
+      await elements.player.play();
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      playbackStarted = !elements.player.paused && !elements.player.seeking;
+    } catch (error) {
+      lastPlaybackError = error;
+    }
+    if (!playbackStarted) await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  if (!playbackStarted) {
+    throw lastPlaybackError || new Error("Unable to start playback for the seek test.");
+  }
   const minimumTime = Math.min(30, duration * 0.05);
   const usableDuration = Math.max(1, duration - minimumTime * 2);
   const results = [];
@@ -2558,10 +2603,13 @@ async function runSeekStressTest(iterations = 20) {
   for (let index = 0; index < iterations; index += 1) {
     const cycle = Math.floor(index / seekTestFractions.length);
     const fraction = (seekTestFractions[index % seekTestFractions.length] + cycle * 0.037) % 0.94;
-    const targetTime = minimumTime + usableDuration * Math.max(0.03, fraction);
+    const requestedTargetTime = minimumTime + usableDuration * Math.max(0.03, fraction);
+    const targetTime = getFragmentAlignedSeekTime(requestedTargetTime);
     if (status) status.textContent = `Running ${index + 1}/${iterations} at ${targetTime.toFixed(1)}s`;
     const result = await waitForSeekTestPlayback(targetTime, 30000, expectedParticipantCount);
     result.iteration = index + 1;
+    result.requestedTargetTime = Number(requestedTargetTime.toFixed(3));
+    result.fragmentAlignmentMs = Math.round((targetTime - requestedTargetTime) * 1000);
     results.push(result);
     if (result.timedOut && !seekTestContinuesAfterTimeout()) break;
     if (result.timedOut) {
