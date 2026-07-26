@@ -403,6 +403,9 @@ function createPlaybackSyncPayload(room) {
             : null;
       return {
         clientId: status.clientId,
+        currentTime: Number(status.currentTime.toFixed(3)),
+        referenceTime: Number(referenceTime.toFixed(3)),
+        rawOffsetMs,
         offsetMs,
         adjustmentMs,
         buffering: status.buffering,
@@ -492,9 +495,11 @@ function retryPendingSeekForClient(room, socket, status, timestamp) {
   if (reachedTarget) return;
   if (status.buffering || status.applyingSeek) return;
   if (timestamp - room.pendingSeekCommand.updatedAt < seekCommandInitialGraceMs) return;
-  if (socket.context.lastSeekCommandActionId === command.actionId) return;
+  const lastSentAt = Number(socket.context.lastSeekCommandSentAt) || 0;
+  if (socket.context.lastSeekCommandActionId === command.actionId && timestamp - lastSentAt < seekCommandInitialGraceMs) return;
 
   socket.context.lastSeekCommandActionId = command.actionId;
+  socket.context.lastSeekCommandSentAt = timestamp;
   sendJson(socket, command);
 }
 
