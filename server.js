@@ -248,6 +248,24 @@ function broadcast(room, payload, exceptSocket = null) {
   }
 }
 
+function replaceClientConnection(room, socket) {
+  const clientId = socket.context?.clientId;
+  if (!clientId) {
+    room.clients.add(socket);
+    return;
+  }
+
+  for (const existingSocket of room.clients) {
+    if (existingSocket.context?.clientId !== clientId) continue;
+    room.clients.delete(existingSocket);
+    if (existingSocket.readyState === 0 || existingSocket.readyState === 1) {
+      existingSocket.close(4001, "Replaced by reconnect");
+    }
+  }
+
+  room.clients.add(socket);
+}
+
 function createRoomStatePayload(room) {
   return {
     type: "room-snapshot",
@@ -326,7 +344,13 @@ function refreshRoomSnapshotFromPlayback(room, timestamp = now()) {
 
   const candidates = Array.from(room.clients)
     .map((client) => client.context?.playbackStatus)
-    .filter((status) => projectPlaybackStatus(status, timestamp));
+    .filter((status) => {
+      const projected = projectPlaybackStatus(status, timestamp);
+      return projected &&
+        projected.mediaUrl === room.snapshot.mediaUrl &&
+        projected.mediaReady &&
+        !projected.applyingSeek;
+    });
   if (!candidates.length) return false;
 
   const controlledStatus = room.control.clientId
@@ -349,9 +373,15 @@ function refreshRoomSnapshotFromPlayback(room, timestamp = now()) {
 
 function createPlaybackSyncPayload(room) {
   const timestamp = now();
+  const roomMediaUrl = room.snapshot?.mediaUrl || "";
   const statuses = Array.from(room.clients)
     .map((client) => projectPlaybackStatus(client.context.playbackStatus, timestamp))
     .filter(Boolean);
+  const readyStatuses = statuses.filter((status) =>
+    status.mediaUrl === roomMediaUrl &&
+    status.mediaReady &&
+    !status.applyingSeek
+  );
 
   const seekCommand = createSeekCommandPayload(room, timestamp);
   let referenceClientId = seekCommand?.originClientId || null;
@@ -359,8 +389,8 @@ function createPlaybackSyncPayload(room) {
   let referenceStatus = referenceClientId
     ? statuses.find((status) => status.clientId === referenceClientId) || null
     : null;
-  if (referenceTime === null && statuses.length > 0) {
-    const reference = statuses.reduce((latest, status) =>
+  if (referenceTime === null && readyStatuses.length > 0) {
+    const reference = readyStatuses.reduce((latest, status) =>
       status.currentTime > latest.currentTime ? status : latest
     );
     referenceClientId = reference.clientId;
@@ -368,7 +398,7 @@ function createPlaybackSyncPayload(room) {
     referenceStatus = reference;
   }
 
-  referenceTime ??= 0;
+  referenceTime ??= Math.max(0, Number(room.snapshot?.currentTime) || 0);
   const lastAction = room.snapshot?.lastAction;
   const lastActionAt = Number(room.snapshot?.updatedAt) || 0;
   const actionSyncActive = (lastAction === "seek" || lastAction === "pause") &&
@@ -376,11 +406,14 @@ function createPlaybackSyncPayload(room) {
   return {
     type: "playback-sync",
     roomId: room.roomId,
+    mediaUrl: roomMediaUrl,
     referenceClientId,
-    referenceBuffering: Boolean(
-      referenceStatus &&
-      (referenceStatus.buffering || referenceStatus.applyingSeek || !referenceStatus.mediaReady)
-    ),
+    referencePaused: referenceStatus ? referenceStatus.paused : room.snapshot?.paused !== false,
+    referenceBuffering: readyStatuses.length === 0 ||
+      Boolean(
+        referenceStatus &&
+        (referenceStatus.buffering || referenceStatus.applyingSeek || !referenceStatus.mediaReady)
+      ),
     seekActionId: seekCommand?.actionId || null,
     offsets: statuses.map((status) => {
       const rawAdjustmentMs = Math.round((referenceTime - status.currentTime) * 1000);
@@ -394,7 +427,10 @@ function createPlaybackSyncPayload(room) {
       const seekRecoveryActive = Boolean(room.lastSeekAt) &&
         timestamp - room.lastSeekAt <= playbackSeekRecoveryWindowMs &&
         rawOffsetMs > playbackSyncToleranceMs;
-      const reason = status.buffering
+      const statusUnavailable = status.mediaUrl !== roomMediaUrl ||
+        !status.mediaReady ||
+        status.applyingSeek;
+      const reason = status.buffering || statusUnavailable
         ? "buffering"
         : seekRecoveryActive || lastAction === "seek" && actionSyncActive
           ? "seek"
@@ -408,7 +444,7 @@ function createPlaybackSyncPayload(room) {
         rawOffsetMs,
         offsetMs,
         adjustmentMs,
-        buffering: status.buffering,
+        buffering: status.buffering || statusUnavailable,
         active: Boolean(reason),
         reason
       };
@@ -1910,7 +1946,7 @@ wss.on("connection", (socket, request) => {
       hasExtension
     };
 
-    room.clients.add(socket);
+    replaceClientConnection(room, socket);
     refreshRoomSnapshotFromPlayback(room);
 
     sendJson(socket, {
@@ -2057,8 +2093,11 @@ wss.on("connection", (socket, request) => {
 
     socket.on("close", () => {
       room.clients.delete(socket);
+      const replacementActive = Array.from(room.clients).some(
+        (client) => client.context?.clientId === socket.context.clientId
+      );
 
-      if (room.control.clientId === socket.context.clientId) {
+      if (!replacementActive && room.control.clientId === socket.context.clientId) {
         room.control = {
           clientId: null,
           name: "",
@@ -2068,7 +2107,7 @@ wss.on("connection", (socket, request) => {
         };
       }
 
-      if (room.lastSeekClientId === socket.context.clientId) {
+      if (!replacementActive && room.lastSeekClientId === socket.context.clientId) {
         room.lastSeekClientId = null;
         room.lastSeekAt = 0;
       }
