@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 
 const config = JSON.parse(readFileSync(new URL("../e2e.config.json", import.meta.url), "utf8"));
 
@@ -59,13 +60,16 @@ async function waitForMedia(page, mediaUrl) {
   }).toBe(true);
 }
 
-async function waitForPlayback(pageA, pageB, expectedPosition = undefined) {
+async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncLog = null, persistSyncLog = null) {
+  let finalSamples = [];
+  const synchronizationStartedAt = Date.now();
   await expect.poll(async () => {
     const samples = await Promise.all([pageA, pageB].map((page) => page.locator("#player").evaluate((video) => ({
       currentTime: video.currentTime,
       paused: video.paused,
       readyState: video.readyState
     }))));
+    finalSamples = samples;
     if (samples.some((sample) => sample.readyState < 1 || sample.paused)) {
       return false;
     }
@@ -81,6 +85,20 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined) {
   const settleMs = Math.max(0, Number(config.playbackSettleMs) || 0);
   if (settleMs > 0) {
     await pageA.waitForTimeout(settleMs);
+  }
+
+  if (syncLog) {
+    syncLog.push({
+      targetPosition: expectedPosition ?? null,
+      convergenceWaitMs: Date.now() - synchronizationStartedAt - settleMs,
+      settledAfterMs: settleMs,
+      totalWaitMs: Date.now() - synchronizationStartedAt,
+      samples: finalSamples.map(({ currentTime, readyState }) => ({ currentTime, readyState })),
+      deltaMs: Math.round(Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000)
+    });
+    if (persistSyncLog) {
+      await persistSyncLog();
+    }
   }
 }
 
@@ -111,6 +129,16 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   const roomId = await createRoom(request);
   const first = await openRoom(browser, roomId);
   const second = await openRoom(browser, roomId);
+  const syncLog = [];
+  const syncLogPath = new URL("../../.notes/build-codex/latest-sync-log.json", import.meta.url);
+  const persistSyncLog = async () => {
+    await mkdir(new URL("../../.notes/build-codex/", import.meta.url), { recursive: true });
+    await writeFile(syncLogPath, `${JSON.stringify({
+      config: { ...config, mediaUrl: config.mediaUrl ? "[redacted]" : "" },
+      roomId,
+      entries: syncLog
+    }, null, 2)}\n`, "utf8");
+  };
 
   await loadMediaFromBridge(first.page, roomId, mediaUrl);
   await Promise.all([waitForMedia(first.page, mediaUrl), waitForMedia(second.page, mediaUrl)]);
@@ -120,7 +148,7 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   ]);
 
   await togglePlayback(first.page);
-  await waitForPlayback(first.page, second.page);
+  await waitForPlayback(first.page, second.page, undefined, syncLog, persistSyncLog);
 
   const random = createRandom(config.randomSeed);
   const seekCount = Math.max(0, Math.floor(Number(config.seekCount) || config.seekPositionsSec?.length || 0));
@@ -148,7 +176,7 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
     await expect.poll(async () => (await pipelineState(first.page))?.version).toBeGreaterThan(versionBeforeSeek);
     const versionAfterSeek = (await pipelineState(first.page)).version;
     await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionAfterSeek);
-    await waitForPlayback(first.page, second.page, targetPosition);
+    await waitForPlayback(first.page, second.page, targetPosition, syncLog, persistSyncLog);
   }
 
   const versionBeforePause = (await pipelineState(first.page)).version;
@@ -175,7 +203,17 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
     body: Buffer.from(JSON.stringify({
       config: { ...config, mediaUrl: config.mediaUrl ? "[redacted]" : "" },
       roomId,
-      seekCount
+      seekCount,
+      entries: syncLog
+    }, null, 2)),
+    contentType: "application/json"
+  });
+
+  await testInfo.attach("e2e-sync-log", {
+    body: Buffer.from(JSON.stringify({
+      config: { ...config, mediaUrl: config.mediaUrl ? "[redacted]" : "" },
+      roomId,
+      entries: syncLog
     }, null, 2)),
     contentType: "application/json"
   });
