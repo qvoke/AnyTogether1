@@ -83,6 +83,13 @@ npm run test:e2e
 play, seek, and pause check. Replace `mediaUrl` there with a public
 CORS-enabled MP4 or HLS VOD source when it expires.
 
+The remaining E2E command settings mirror the seektest configuration:
+`run` enables the scenario, `participants` selects the supported participant
+count, `seekMode` chooses `manual` or deterministic `random` positions,
+`seekCount` sets the number of seeks, `seekPositionsSec` supplies manual
+positions, `randomSeed` controls random replayability, `playbackSettleMs`
+waits after clocks converge, and `holdMs` keeps the final playback running.
+
 ```powershell
 npm run test:e2e:watch
 ```

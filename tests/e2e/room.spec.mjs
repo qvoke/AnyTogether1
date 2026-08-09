@@ -3,6 +3,14 @@ import { readFileSync } from "node:fs";
 
 const config = JSON.parse(readFileSync(new URL("../e2e.config.json", import.meta.url), "utf8"));
 
+function createRandom(seed) {
+  let value = (Number(seed) || 0) >>> 0;
+  return () => {
+    value = (value * 1_664_525 + 1_013_904_223) >>> 0;
+    return value / 4_294_967_296;
+  };
+}
+
 async function createRoom(request) {
   const response = await request.post("/api/rooms", { data: { title: "E2E synchronization room" } });
   if (!response.ok()) {
@@ -69,6 +77,11 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined) {
     }
     return samples.every((sample) => Math.abs(sample.currentTime - expectedPosition) < 1.5);
   }, { intervals: [100, 250, 500, 1_000], timeout: 30_000 }).toBe(true);
+
+  const settleMs = Math.max(0, Number(config.playbackSettleMs) || 0);
+  if (settleMs > 0) {
+    await pageA.waitForTimeout(settleMs);
+  }
 }
 
 async function togglePlayback(page) {
@@ -76,6 +89,7 @@ async function togglePlayback(page) {
 }
 
 test("two isolated browser contexts join the same synchronized room", async ({ browser, request }) => {
+  test.skip(config.run !== true || Number(config.participants) !== 2, "The E2E command config disables the two-participant scenario.");
   const roomId = await createRoom(request);
   const first = await openRoom(browser, roomId);
   const second = await openRoom(browser, roomId);
@@ -91,6 +105,8 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   test.setTimeout(120_000);
   const mediaUrl = process.env.E2E_MEDIA_URL || config.mediaUrl;
   test.skip(!mediaUrl, "Set E2E_MEDIA_URL or tests/e2e.config.json mediaUrl to a public CORS-enabled MP4 or HLS VOD URL.");
+  test.skip(config.run !== true || Number(config.participants) !== 2, "The E2E command config disables the two-participant scenario.");
+  test.skip(config.seekMode === "manual" && !config.seekPositionsSec?.length, "Manual seek mode requires at least one position.");
 
   const roomId = await createRoom(request);
   const first = await openRoom(browser, roomId);
@@ -106,21 +122,49 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   await togglePlayback(first.page);
   await waitForPlayback(first.page, second.page);
 
-  const duration = await first.page.locator("#player").evaluate((video) => video.duration);
-  const targetPosition = Math.max(
-    0.5,
-    Math.min(config.seekPositionsSec[0] || 5, Number.isFinite(duration) ? duration - 0.1 : config.seekPositionsSec[0] || 5)
-  );
-  const versionBeforeSeek = (await pipelineState(first.page)).version;
-  await first.page.locator("#player").evaluate((video, position) => {
-    video.currentTime = position;
-  }, targetPosition);
-  await expect.poll(async () => (await pipelineState(second.page))?.version).toBeGreaterThan(versionBeforeSeek);
-  await waitForPlayback(first.page, second.page, targetPosition);
+  const random = createRandom(config.randomSeed);
+  const seekCount = Math.max(0, Math.floor(Number(config.seekCount) || config.seekPositionsSec?.length || 0));
+  for (let index = 0; index < seekCount; index += 1) {
+    const sourcePage = index % 2 === 0 ? first.page : second.page;
+    const mediaSample = await sourcePage.locator("#player").evaluate((video) => ({
+      currentTime: video.currentTime,
+      duration: video.duration
+    }));
+    const duration = mediaSample.duration;
+    const maxPosition = Number.isFinite(duration) ? Math.max(0.5, duration - 0.1) : Number.MAX_SAFE_INTEGER;
+    const requestedPosition = config.seekMode === "random"
+      ? random() * maxPosition
+      : config.seekPositionsSec[index % config.seekPositionsSec.length];
+    let targetPosition = Math.max(0.5, Math.floor(Math.min(requestedPosition, maxPosition) * 100) / 100);
+    if (Math.abs(targetPosition - mediaSample.currentTime) < 0.75) {
+      targetPosition = targetPosition + 1 < maxPosition ? targetPosition + 1 : Math.max(0.5, targetPosition - 1);
+    }
 
+    const versionBeforeSeek = (await pipelineState(first.page)).version;
+    await sourcePage.locator("#player").evaluate((video, position) => {
+      video.currentTime = position;
+      video.dispatchEvent(new Event("seeked"));
+    }, targetPosition);
+    await expect.poll(async () => (await pipelineState(first.page))?.version).toBeGreaterThan(versionBeforeSeek);
+    const versionAfterSeek = (await pipelineState(first.page)).version;
+    await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionAfterSeek);
+    await waitForPlayback(first.page, second.page, targetPosition);
+  }
+
+  const versionBeforePause = (await pipelineState(first.page)).version;
   await togglePlayback(first.page);
+  await expect.poll(async () => (await pipelineState(first.page))?.version).toBeGreaterThan(versionBeforePause);
+  const versionAfterPause = (await pipelineState(first.page)).version;
+  await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionAfterPause);
   await expect.poll(async () => (await pipelineState(first.page))?.paused).toBe(true);
   await expect.poll(async () => (await pipelineState(second.page))?.paused).toBe(true);
+
+  const versionBeforeResume = (await pipelineState(first.page)).version;
+  await togglePlayback(first.page);
+  await expect.poll(async () => (await pipelineState(first.page))?.version).toBeGreaterThan(versionBeforeResume);
+  const versionAfterResume = (await pipelineState(first.page)).version;
+  await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionAfterResume);
+  await waitForPlayback(first.page, second.page);
 
   const holdMs = Number(process.env.E2E_HOLD_MS || config.holdMs || 0);
   if (holdMs > 0) {
@@ -128,7 +172,11 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   }
 
   await testInfo.attach("e2e-sync-summary", {
-    body: Buffer.from(JSON.stringify({ mediaUrl: "[redacted]", roomId, targetPosition }, null, 2)),
+    body: Buffer.from(JSON.stringify({
+      config: { ...config, mediaUrl: config.mediaUrl ? "[redacted]" : "" },
+      roomId,
+      seekCount
+    }, null, 2)),
     contentType: "application/json"
   });
 
