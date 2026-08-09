@@ -4,6 +4,7 @@ const externalBaseUrl = process.env.E2E_BASE_URL;
 const localPort = Number(process.env.E2E_PORT || 3100);
 const localBaseUrl = `http://127.0.0.1:${localPort}`;
 const reuseExistingServer = process.env.E2E_REUSE_SERVER === "1";
+const localStatePath = `.notes/build-codex/e2e-cloudflare-state-${Date.now()}`;
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -14,6 +15,9 @@ export default defineConfig({
     ["json", { outputFile: ".notes/build-codex/e2e-report.json" }],
     ["./scripts/e2e-notify-reporter.mjs"]
   ],
+  expect: {
+    timeout: 15_000
+  },
   timeout: 45_000,
   use: {
     baseURL: externalBaseUrl || localBaseUrl,
@@ -25,8 +29,8 @@ export default defineConfig({
     : {
         command: "npm run dev",
         env: {
-          ...process.env,
           ANYTOGETHER_DATA_DIR: ".notes/build-codex/e2e-data",
+          CLOUDFLARE_STATE_PATH: localStatePath,
           PORT: String(localPort)
         },
         reuseExistingServer,

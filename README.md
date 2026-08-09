@@ -5,6 +5,8 @@ AnyTogether is a synchronized media room interface with:
 - An authoritative, versioned room timeline for media, play, pause, and seek actions
 - Server-time synchronization with local drift correction and automatic reconnection
 - Native MP4 playback and Hls.js playback for public HLS VOD sources
+- Cloudflare Workers, D1, and hibernatable Durable Object WebSockets
+- Accounts, room ownership, participant roles, chat, playlists, and room directory updates
 - A plugin bridge that delivers metasearch results into the page
 
 ## Run locally
@@ -14,14 +16,17 @@ npm install
 npm run dev
 ```
 
-The server always starts at `http://localhost:3000`.
+Vite starts the Cloudflare development runtime at `http://localhost:5173`.
+
+Local D1 and Durable Object state is stored under `.notes/build-codex`. The
+previous JSON files under `data` are not imported, changed, or removed.
 
 ## Playback synchronization
 
-The server owns each room timeline. Clients submit versioned actions through a
-room-specific WebSocket and apply the returned snapshot against the server
-clock. This prevents one browser's buffering, latency, or local playback clock
-from becoming the source of truth.
+Each room's Durable Object owns its timeline. Clients submit versioned actions
+through a room-specific WebSocket and apply the returned snapshot against the
+server clock. This prevents one browser's buffering, latency, or local playback
+clock from becoming the source of truth.
 
 ```json
 {
@@ -59,10 +64,12 @@ from becoming the source of truth.
 Only public HTTPS MP4 and HLS VOD URLs are accepted. Video remains on its
 original host; the room sends only a URL and small synchronization messages.
 
-Run the synchronization checks with:
+Run the protocol, Worker, Durable Object, D1, API, build, lint, and parser checks
+with:
 
 ```bash
-npm run test:sync
+npm test
+npm run lint
 ```
 
 ## Browser end-to-end checks
@@ -79,17 +86,16 @@ Run the room connection smoke test:
 npm run test:e2e
 ```
 
-`tests/e2e.config.json` contains the media source for the complete media,
-play, seek, and pause check. Replace `mediaUrl` there with a public
-CORS-enabled MP4 or HLS VOD source when it expires.
+The tracked E2E configuration never contains a signed media URL. Provide a
+temporary public CORS-enabled MP4 or HLS VOD URL through `E2E_MEDIA_URL` for
+the complete media, reconnect, play, 20-seek, pause, and resume scenario.
 
 The remaining E2E command settings mirror the seektest configuration:
 `run` enables the scenario, `participants` selects the supported participant
 count, `seekMode` chooses `manual` or deterministic `random` positions,
 `seekCount` sets the number of seeks, `seekPositionsSec` supplies manual
 positions, `randomSeed` controls random replayability, `playbackSettleMs`
-waits after clocks converge, `loadingTimeoutMs` aborts a checkpoint that stays
-loading or fails to converge, and `holdMs` keeps the final playback running.
+waits after clocks converge, and `holdMs` keeps the final playback running.
 
 ```powershell
 npm run test:e2e:watch
@@ -114,6 +120,18 @@ AutoHotkey is not available as `AutoHotkey64.exe` on `PATH`.
 The generated sync log records `progressDeltaSec` for both videos and marks
 each checkpoint with `hangDetected` when a playing video fails to advance
 during the settle window.
+
+## Cloudflare data model
+
+D1 stores users, sessions, room membership, ownership, and the room directory.
+The room Durable Object stores room metadata, participants, chat, playlist,
+media metadata, recent action IDs, and the authoritative playback timeline.
+The directory Durable Object serves lobby realtime updates, while room pages
+use `/ws?room=ABC123` and playback synchronization uses
+`/api/rooms/ABC123/ws`.
+
+Versioned D1 migrations are in `drizzle`. Static files are served through the
+`ASSETS` binding, and only `/api/*` plus `/ws` run Worker-first. R2 is not used.
 
 ## Site and extension bridge
 
@@ -157,4 +175,6 @@ Use a simple pattern when inspecting request URLs for direct stream manifests:
 const streamPattern = /\.(?:m3u8|mp4)(?:\?|$)/i;
 ```
 
-The interface keeps playback diagnostics visible in the room log.
+The interface keeps playback diagnostics visible in the room log. Up to 300
+redacted diagnostic records are retained in local storage and up to 500 media
+events remain available through the test bridge.

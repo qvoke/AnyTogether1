@@ -8,7 +8,6 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300..900&family=Outfit:wght@400;600;700;800;900&display=swap" rel="stylesheet" />
   <meta name="description" content="Create a room, drop a stream and watch it together - synchronised playback, live chat and a shared playlist." />
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.14/dist/hls.min.js"></script>
   <link rel="stylesheet" href="/player-styles.css" />
   <style>
     /* =============================================
@@ -3745,7 +3744,7 @@
 
       <!-- PLAYER -->
       <div class="player-area player-shell">
-        <video id="player" playsinline style="display:none"></video>
+        <video id="player" preload="auto" playsinline style="display:none"></video>
 
         <div class="player-media-overlay" aria-hidden="true">
           <strong id="playerMediaTitle"></strong>
@@ -4106,7 +4105,7 @@
         <p id="searchHint" class="hidden"></p>
       </div>
       <section class="concept-player player-shell">
-        <video id="player" playsinline style="display:none"></video>
+        <video id="player" preload="auto" playsinline style="display:none"></video>
         <div class="player-media-overlay"><strong id="playerMediaTitle"></strong><span id="playerMediaTime">00:00 / 00:00</span></div>
         <div class="player-idle-state"><div class="player-idle-icon">▶</div><p>No media loaded — search above or paste a URL</p></div>
         <div id="qualityIndicator" class="quality-indicator hidden"><span id="qiRequested"></span><span id="qiActive"></span></div>
@@ -4371,6 +4370,7 @@
   }
 </script>
 <script type="module" src="/player-ui.js"></script>
+<script type="module" src="/client/app.js"></script>
 <script type="module" src="/app.js"></script>
 <script type="module" src="/shared-topbar.js"></script>
 <script type="module" src="/interface-ui.js"></script>

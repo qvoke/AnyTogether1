@@ -3,6 +3,9 @@
 /node_modules/
 /.notes/
 /.uploads/
+/build/
+/dist/
+/.wrangler/
 
 .env
 .env.*

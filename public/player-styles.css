@@ -1,4 +1,4 @@
-/* ========== Кастомный UI плеера в стиле video.js для hls.js ========== */
+/* Custom video.js-inspired controls for Hls.js */
 
 .player-shell {
   position: relative;
@@ -15,7 +15,7 @@
   display: block;
 }
 
-/* Скрываем нативные контролы браузера */
+/* Native controls would publish a second, uncoordinated interaction surface. */
 .player-shell video::-webkit-media-controls {
   display: none !important;
 }
@@ -26,7 +26,7 @@
   display: none !important;
 }
 
-/* Контейнер кастомных контролов */
+/* Custom controls container */
 .custom-player-controls {
   position: absolute;
   bottom: 0;
@@ -47,7 +47,7 @@
   pointer-events: none;
 }
 
-/* Показываем контролы при наведении на плеер или при фокусе */
+/* Reveal controls for pointer and keyboard interaction. */
 .player-shell:hover .custom-player-controls,
 .player-shell:focus-within .custom-player-controls {
   opacity: 1;
@@ -59,7 +59,7 @@
   pointer-events: auto;
 }
 
-/* Левая часть (play + громкость) — уменьшенный gap между кнопками */
+/* Left controls */
 .controls-left {
   display: contents;
   align-items: center;
@@ -67,7 +67,7 @@
   flex-shrink: 0;
 }
 
-/* Центр (прогресс-бар) */
+/* Progress controls */
 .controls-center {
   grid-column: 1 / -1;
   grid-row: 1;
@@ -75,7 +75,7 @@
   width: 100%;
 }
 
-/* Правая часть (время, настройки, fullscreen) */
+/* Right controls */
 .controls-right {
   position: absolute;
   right: 14px;
@@ -91,7 +91,7 @@
 .player-shell .volume-container { grid-column: 4; grid-row: 2; justify-self: start; }
 .player-shell .time-display { grid-column: 5; grid-row: 2; }
 
-/* Время */
+/* Time display */
 .time-display {
   display: flex;
   align-items: center;
@@ -109,7 +109,7 @@
 }
 
 
-/* Кнопки — переопределяем любые глобальные стили button */
+/* Player buttons must remain isolated from global button styles. */
 .player-shell .ctrl-btn {
   all: unset;
   color: #fff;
@@ -137,7 +137,7 @@
   display: block;
 }
 
-/* Прогресс-бар */
+/* Progress bar */
 .progress-container {
   width: 100%;
   padding: 4px 0;
@@ -153,7 +153,7 @@
   cursor: pointer;
 }
 
-/* Буферизированная часть (серая полоса под fill) */
+/* Buffered range */
 .buffer-fill {
   position: absolute;
   top: 0;
@@ -176,7 +176,7 @@
   pointer-events: none;
 }
 
-/* Handle (круглая точка) — видна всегда */
+/* The seek handle remains visible for keyboard and pointer feedback. */
 .progress-handle {
   position: absolute;
   top: 50%;
@@ -201,12 +201,12 @@
   opacity: 1;
 }
 
-/* Когда пользователь тянет ползунок — fill становится синим (ожидание загрузки) */
+/* Seeking uses a distinct fill while the requested position loads. */
 .progress-bar.seeking .progress-fill {
   background: #6c8cff;
 }
 
-/* Громкость — показываем полоску только при наведении */
+/* Reveal volume adjustment on hover. */
 .volume-container {
   display: flex;
   align-items: center;
@@ -227,7 +227,7 @@
   width: 60px;
 }
 
-/* Когда volume-bar расширяется, сужаем прогресс-бар */
+/* Reserve progress space while the volume control expands. */
 .volume-container:hover ~ .controls-center,
 .volume-container:hover + * + .controls-center {
   max-width: calc(100% - 52px);
@@ -240,9 +240,9 @@
   transition: width 0.1s;
 }
 
-/* Меню качества — привязано к плееру */
+/* Quality menu */
 .player-shell {
-  /* для абсолютного позиционирования меню */
+  /* The menu is anchored to the player shell. */
 }
 
 .quality-menu-overlay {
@@ -293,7 +293,7 @@
   font-weight: 700;
 }
 
-/* ========== Спиннер загрузки по центру ========== */
+/* Center loading spinner */
 .player-center-spinner {
   position: absolute;
   top: 50%;
@@ -308,7 +308,7 @@
   opacity: 1;
 }
 
-/* ========== Центральный overlay для временных значков (play/pause) ========== */
+/* Transient play and pause overlay */
 .player-center-overlay {
   position: absolute;
   top: 50%;
@@ -332,7 +332,7 @@
   border-radius: 50%;
 }
 
-/* Индикатор качества */
+/* Quality indicator */
 .quality-indicator {
   position: absolute;
   top: 12px;
@@ -370,7 +370,7 @@
   color: rgba(255, 255, 255, 0.2);
 }
 
-/* Fullscreen режим: video на весь экран */
+/* Fullscreen video layout */
 .player-shell.is-fullscreen {
   position: fixed;
   top: 0;

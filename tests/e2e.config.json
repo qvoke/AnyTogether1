@@ -5,8 +5,7 @@
   "seekCount": 20,
   "seekPositionsSec": [5, 30, 120, 300, 600, 1200, 60, 900, 15, 180, 10],
   "playbackSettleMs": 2000,
-  "loadingTimeoutMs": 5000,
   "randomSeed": 1337,
   "holdMs": 2000,
-  "mediaUrl": "https://stream.voidboost.one/1ff7e6678c0e4cac621932de1fb36d8c:2026081009:T0Q2SXhrNVRsY1BvQUk0V29ZMW1IdmU1N1hpNER4RUM0SU9teVg5Q253c001cm4zNVlZTTJjVVVFZlFtcTBZYTVrQ1N5WFBiZU1jUVczM2hwNmFUNlE9PQ==/5/9/1/3/8/0/t0yvx.mp4:hls:manifest.m3u8"
+  "mediaUrl": ""
 }

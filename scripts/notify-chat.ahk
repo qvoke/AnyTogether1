@@ -6,9 +6,8 @@ exitCode := A_Args.Length >= 3 ? A_Args[3] : "0"
 status := exitCode = "0" ? "passed" : "failed"
 message := "E2E test " status ". RunId: " runId
 if (resultPath != "") {
-  message .= " | Результаты: " resultPath
+  message .= " | Results: " resultPath
 }
-
 
 Click(1700, 900)
 Sleep(250)

@@ -191,6 +191,7 @@ const guestIdentityCard = document.getElementById("guestIdentityCard");
 
 const state = {
   ws: null,
+  wsReconnectTimer: null,
   connected: false,
   authToken: loadStoredValue(STORAGE_KEYS.authToken) || null,
   currentUser: null,
@@ -4394,10 +4395,15 @@ function renderRoomsPageNow() {
 }
 
 function connectWs() {
+  if (state.wsReconnectTimer !== null) {
+    window.clearTimeout(state.wsReconnectTimer);
+    state.wsReconnectTimer = null;
+  }
   if (state.ws && state.ws.readyState === WebSocket.OPEN) {
     state.ws.close();
   }
-  state.ws = new WebSocket(resolveBackendWsUrl("/ws"));
+  const realtimePath = queryRoom ? `/ws?room=${encodeURIComponent(queryRoom)}` : "/ws";
+  state.ws = new WebSocket(resolveBackendWsUrl(realtimePath));
 
   state.ws.addEventListener("open", () => {
     state.connected = true;
@@ -4639,6 +4645,7 @@ function connectWs() {
   state.ws.addEventListener("close", () => {
     state.connected = false;
     setRoomStatus("WebSocket disconnected", true);
+    state.wsReconnectTimer = window.setTimeout(connectWs, 1200);
   });
 
   state.ws.addEventListener("error", () => {

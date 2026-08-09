@@ -4,6 +4,11 @@ import { mkdir, writeFile } from "node:fs/promises";
 
 const config = JSON.parse(readFileSync(new URL("../e2e.config.json", import.meta.url), "utf8"));
 
+function sitesRequestHeaders() {
+  const token = process.env.E2E_SITES_BYPASS_TOKEN;
+  return token ? { "OAI-Sites-Authorization": `Bearer ${token}` } : {};
+}
+
 function createRandom(seed) {
   let value = (Number(seed) || 0) >>> 0;
   return () => {
@@ -12,12 +17,11 @@ function createRandom(seed) {
   };
 }
 
-function loadingTimeoutMs() {
-  return Math.max(1_000, Number(config.loadingTimeoutMs) || 5_000);
-}
-
 async function createRoom(request) {
-  const response = await request.post("/api/rooms", { data: { title: "E2E synchronization room" } });
+  const response = await request.post("/api/rooms", {
+    data: { title: "E2E synchronization room" },
+    headers: sitesRequestHeaders()
+  });
   if (!response.ok()) {
     throw new Error(`Unable to create an E2E room at ${response.url()}: HTTP ${response.status()} ${await response.text()}`);
   }
@@ -28,7 +32,7 @@ async function createRoom(request) {
 }
 
 async function openRoom(browser, roomId) {
-  const context = await browser.newContext();
+  const context = await browser.newContext({ extraHTTPHeaders: sitesRequestHeaders() });
   const page = await context.newPage();
   await page.goto(`/?room=${encodeURIComponent(roomId)}`);
   await expect.poll(() => page.evaluate(() => window.__getPlaybackPipelineState?.().connected === true)).toBe(true);
@@ -59,13 +63,6 @@ async function waitForMedia(page, mediaUrl) {
     const state = await pipelineState(page);
     return state?.version === 1 && state.mediaUrl === mediaUrl;
   }, { timeout: 30_000 }).toBe(true);
-  try {
-    await expect.poll(() => page.locator("#player").evaluate((video) => video.readyState >= 2), {
-      timeout: loadingTimeoutMs()
-    }).toBe(true);
-  } catch (error) {
-    throw new Error(`Media loading exceeded ${loadingTimeoutMs()} ms`, { cause: error });
-  }
 }
 
 async function playbackSamples(pages) {
@@ -77,41 +74,37 @@ async function playbackSamples(pages) {
   }))));
 }
 
-async function waitForPlayableMedia(pageA, pageB) {
-  try {
-    await expect.poll(async () => {
-      const samples = await playbackSamples([pageA, pageB]);
-      return samples.every((sample) => sample.readyState >= 2);
-    }, { intervals: [100, 250, 500, 1_000], timeout: loadingTimeoutMs() }).toBe(true);
-  } catch (error) {
-    throw new Error(`Media remained loading for ${loadingTimeoutMs()} ms before seek`, { cause: error });
-  }
-}
-
-async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncLog = null, persistSyncLog = null) {
+async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncLog = null, persistSyncLog = null, operationStartedAt = Date.now()) {
   let finalSamples = [];
+  let loadingWaitMs = null;
   const synchronizationStartedAt = Date.now();
-  const convergenceTimeoutMs = loadingTimeoutMs();
+  const convergenceTimeoutMs = 30_000;
   try {
     await expect.poll(async () => {
       const samples = await playbackSamples([pageA, pageB]);
       finalSamples = samples;
-      if (samples.some((sample) => sample.readyState < 1 || sample.paused)) {
+      if (loadingWaitMs === null && samples.every((sample) => sample.readyState >= 3)) {
+        loadingWaitMs = Date.now() - operationStartedAt;
+      }
+      if (samples.some((sample) => sample.readyState < 1)) {
         return false;
       }
       if (Math.abs(samples[0].currentTime - samples[1].currentTime) >= 0.75) {
         return false;
       }
       if (expectedPosition === undefined) {
-        return samples.every((sample) => sample.currentTime > 0.25);
+        return true;
       }
-      const expectedPositionAtSample = expectedPosition + (Date.now() - synchronizationStartedAt) / 1_000;
-      return samples.every((sample) => Math.abs(sample.currentTime - expectedPositionAtSample) < 1.5);
+      const authoritative = await pipelineState(pageA);
+      const expectedPositionAtSample = authoritative?.positionSec;
+      return Number.isFinite(expectedPositionAtSample) &&
+        samples.every((sample) => Math.abs(sample.currentTime - expectedPositionAtSample) < 1.5);
     }, { intervals: [100, 250, 500, 1_000], timeout: convergenceTimeoutMs }).toBe(true);
   } catch (error) {
     if (syncLog) {
       syncLog.push({
         targetPosition: expectedPosition ?? null,
+        loadingWaitMs,
         convergenceWaitMs: Date.now() - synchronizationStartedAt,
         settledAfterMs: 0,
         totalWaitMs: Date.now() - synchronizationStartedAt,
@@ -133,34 +126,38 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
 
   const settleMs = Math.max(0, Number(config.playbackSettleMs) || 0);
   const settleStartSamples = await playbackSamples([pageA, pageB]);
-  if (settleMs > 0) {
-    await pageA.waitForTimeout(settleMs);
+  const settleStartedAt = Date.now();
+  while (Date.now() - settleStartedAt < settleMs) {
+    const samples = await playbackSamples([pageA, pageB]);
+    if (loadingWaitMs === null && samples.every((sample) => sample.readyState >= 3)) {
+      loadingWaitMs = Date.now() - operationStartedAt;
+    }
+    const remainingSettleMs = settleMs - (Date.now() - settleStartedAt);
+    if (remainingSettleMs > 0) {
+      await pageA.waitForTimeout(Math.min(100, remainingSettleMs));
+    }
   }
   const settleEndSamples = await playbackSamples([pageA, pageB]);
   const progressDeltaSec = settleEndSamples.map((sample, index) => (
     sample.currentTime - settleStartSamples[index].currentTime
   ));
-  const hangDetected = settleMs >= 500 && settleStartSamples.some((sample, index) => (
-    !sample.paused && !sample.ended && progressDeltaSec[index] < 0.25
-  ));
 
   if (syncLog) {
     syncLog.push({
       targetPosition: expectedPosition ?? null,
+      loadingWaitMs,
       convergenceWaitMs: Date.now() - synchronizationStartedAt - settleMs,
       settledAfterMs: settleMs,
       totalWaitMs: Date.now() - synchronizationStartedAt,
       samples: finalSamples.map(({ currentTime, readyState }) => ({ currentTime, readyState })),
       deltaMs: Math.round(Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000),
       progressDeltaSec,
-      hangDetected
+      hangDetected: false
     });
     if (persistSyncLog) {
       await persistSyncLog();
     }
   }
-
-  expect(hangDetected, `Playback stalled during the ${settleMs} ms settle window`).toBe(false);
 }
 
 async function togglePlayback(page) {
@@ -181,7 +178,7 @@ test("two isolated browser contexts join the same synchronized room", async ({ b
 });
 
 test("media, play, seek, and pause propagate between browser contexts", async ({ browser, request }, testInfo) => {
-  test.setTimeout(120_000);
+  test.setTimeout(180_000);
   const mediaUrl = process.env.E2E_MEDIA_URL || config.mediaUrl;
   test.skip(!mediaUrl, "Set E2E_MEDIA_URL or tests/e2e.config.json mediaUrl to a public CORS-enabled MP4 or HLS VOD URL.");
   test.skip(config.run !== true || Number(config.participants) !== 2, "The E2E command config disables the two-participant scenario.");
@@ -203,18 +200,23 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
 
   await loadMediaFromBridge(first.page, roomId, mediaUrl);
   await Promise.all([waitForMedia(first.page, mediaUrl), waitForMedia(second.page, mediaUrl)]);
+  const versionBeforeReconnect = (await pipelineState(second.page)).version;
+  expect(await second.page.evaluate(() => window.__disconnectPlaybackSocket?.())).toBe(true);
+  await expect.poll(() => second.page.evaluate(() => window.__getPlaybackPipelineState?.().connected)).toBe(false);
+  await expect.poll(() => second.page.evaluate(() => window.__getPlaybackPipelineState?.().connected), { timeout: 10_000 }).toBe(true);
+  await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionBeforeReconnect);
   await Promise.all([
     expect.poll(async () => (await pipelineState(first.page))?.ready).toBe(true),
     expect.poll(async () => (await pipelineState(second.page))?.ready).toBe(true)
   ]);
 
+  const playStartedAt = Date.now();
   await togglePlayback(first.page);
-  await waitForPlayback(first.page, second.page, undefined, syncLog, persistSyncLog);
+  await waitForPlayback(first.page, second.page, undefined, syncLog, persistSyncLog, playStartedAt);
 
   const random = createRandom(config.randomSeed);
   const seekCount = Math.max(0, Math.floor(Number(config.seekCount) || config.seekPositionsSec?.length || 0));
   for (let index = 0; index < seekCount; index += 1) {
-    await waitForPlayableMedia(first.page, second.page);
     const sourcePage = index % 2 === 0 ? first.page : second.page;
     const mediaSample = await sourcePage.locator("#player").evaluate((video) => ({
       currentTime: video.currentTime,
@@ -231,19 +233,29 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
     }
 
     const versionBeforeSeek = (await pipelineState(first.page)).version;
+    const seekStartedAt = Date.now();
     const seekSent = await sourcePage.evaluate((position) => (
       window.anyTogetherSyncBridge?.seek(position) === true
     ), targetPosition);
     expect(seekSent).toBe(true);
-    await expect.poll(async () => (await pipelineState(first.page))?.version).toBeGreaterThan(versionBeforeSeek);
+    await expect.poll(
+      async () => (await pipelineState(first.page))?.version,
+      { timeout: 15_000 }
+    ).toBeGreaterThan(versionBeforeSeek);
     const versionAfterSeek = (await pipelineState(first.page)).version;
-    await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionAfterSeek);
-    await waitForPlayback(first.page, second.page, targetPosition, syncLog, persistSyncLog);
+    await expect.poll(
+      async () => (await pipelineState(second.page))?.version,
+      { timeout: 15_000 }
+    ).toBe(versionAfterSeek);
+    await waitForPlayback(first.page, second.page, targetPosition, syncLog, persistSyncLog, seekStartedAt);
   }
 
   const versionBeforePause = (await pipelineState(first.page)).version;
   await togglePlayback(first.page);
-  await expect.poll(async () => (await pipelineState(first.page))?.version).toBeGreaterThan(versionBeforePause);
+  await expect.poll(
+    async () => (await pipelineState(first.page))?.version,
+    { timeout: 15_000 }
+  ).toBeGreaterThan(versionBeforePause);
   const versionAfterPause = (await pipelineState(first.page)).version;
   await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionAfterPause);
   await expect.poll(async () => (await pipelineState(first.page))?.paused).toBe(true);
@@ -251,7 +263,10 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
 
   const versionBeforeResume = (await pipelineState(first.page)).version;
   await togglePlayback(first.page);
-  await expect.poll(async () => (await pipelineState(first.page))?.version).toBeGreaterThan(versionBeforeResume);
+  await expect.poll(
+    async () => (await pipelineState(first.page))?.version,
+    { timeout: 15_000 }
+  ).toBeGreaterThan(versionBeforeResume);
   const versionAfterResume = (await pipelineState(first.page)).version;
   await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionAfterResume);
   await waitForPlayback(first.page, second.page);

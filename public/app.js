@@ -13,6 +13,9 @@ const RECONNECT_DELAY_MS = 1_200;
 const PERIODIC_SYNC_INTERVAL_MS = 3_000;
 const HARD_SYNC_THRESHOLD_SEC = 0.15;
 const SOFT_SYNC_THRESHOLD_SEC = 0.04;
+const Hls = window.Hls;
+const DIAGNOSTIC_STORAGE_KEY = "anytogether:sync-diagnostics";
+const MAX_DIAGNOSTIC_ENTRIES = 300;
 
 const state = {
   clientId: getClientId(),
@@ -20,16 +23,20 @@ const state = {
   connection: null,
   connectionGeneration: 0,
   hls: null,
+  lastHlsRecoveryAt: 0,
+  lastHlsLoadVersion: null,
   lastSyncErrorMs: 0,
   playbackBlocked: false,
+  mediaBuffering: false,
   reconnectTimer: null,
   remotePlayUntil: 0,
   remoteSeek: null,
-  localSeekActive: false,
+  pendingSeek: null,
   resetRateTimer: null,
   roomId: null,
   roomState: null,
   sourceId: null,
+  playbackEvents: [],
   isApplyingRemoteEvent: false
 };
 
@@ -51,6 +58,38 @@ function getClientId() {
 function logSyncEvent(title, detail = "") {
   window.dispatchEvent(new CustomEvent("anytogether:sync-log", { detail: { title, detail } }));
   console.info(`[Sync] ${title}`, detail);
+  storeDiagnostic({ type: "event", title, detail });
+}
+
+function storeDiagnostic(entry) {
+  try {
+    const stored = JSON.parse(localStorage.getItem(DIAGNOSTIC_STORAGE_KEY) || "[]");
+    const diagnostics = Array.isArray(stored) ? stored : [];
+    diagnostics.push(redactDiagnostic({ at: Date.now(), ...entry }));
+    localStorage.setItem(DIAGNOSTIC_STORAGE_KEY, JSON.stringify(diagnostics.slice(-MAX_DIAGNOSTIC_ENTRIES)));
+  } catch {}
+}
+
+function redactDiagnostic(value) {
+  return JSON.parse(JSON.stringify(value, (_key, item) => {
+    if (typeof item !== "string") {
+      return item;
+    }
+    return item.replace(/https:\/\/[^\s"']+/gi, "[redacted-url]");
+  }));
+}
+
+function recordPlaybackEvent(type, player) {
+  state.playbackEvents.push({
+    type,
+    at: Date.now(),
+    currentTime: player.currentTime,
+    readyState: player.readyState,
+    paused: player.paused
+  });
+  if (state.playbackEvents.length > 500) {
+    state.playbackEvents.splice(0, state.playbackEvents.length - 500);
+  }
 }
 
 function setConnectionState(label) {
@@ -84,7 +123,7 @@ function clampPosition(position, duration) {
   if (!Number.isFinite(duration)) {
     return Math.max(0, position);
   }
-  return Math.max(0, Math.min(position, Math.max(0, duration - 0.01)));
+  return Math.max(0, Math.min(position, Math.max(0, duration - 0.04)));
 }
 
 function isSocketOpen() {
@@ -193,6 +232,7 @@ function processServerMessage(message) {
     if (!Number.isFinite(state.roundTripMs) || roundTripMs <= state.roundTripMs) {
       state.clockOffsetMs = estimatedOffset;
       state.roundTripMs = roundTripMs;
+      storeDiagnostic({ type: "clock", roundTripMs, clockOffsetMs: estimatedOffset });
     }
     return;
   }
@@ -221,7 +261,18 @@ function applySnapshot(nextState, serverTimeMs) {
   }
 
   const previousSourceId = state.roomState?.media?.id || null;
+  storeDiagnostic({
+    type: "delivery",
+    deliveryMs: Math.max(0, Date.now() - (serverTimeMs - state.clockOffsetMs)),
+    version: nextState.version
+  });
   state.roomState = nextState;
+  if (state.pendingSeek && nextState.version > state.pendingSeek.baseVersion) {
+    const confirmedPosition = getPositionAt(nextState, serverTimeMs);
+    if (Math.abs(confirmedPosition - state.pendingSeek.positionSec) < 0.5) {
+      state.pendingSeek = null;
+    }
+  }
   if (elements.revisionLabel) {
     elements.revisionLabel.textContent = String(nextState.version);
   }
@@ -271,14 +322,11 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
   if (!player || !roomState?.media || player.readyState < HTMLMediaElement.HAVE_METADATA) {
     return;
   }
-  if (state.localSeekActive && reason !== "seeked") {
-    return;
-  }
-
   const expectedPosition = clampPosition(getPositionAt(roomState, serverTimeMs), player.duration);
   const error = expectedPosition - player.currentTime;
   const absoluteError = Math.abs(error);
   state.lastSyncErrorMs = Math.round(absoluteError * 1_000);
+  storeDiagnostic({ type: "sync", reason, errorMs: state.lastSyncErrorMs, version: roomState.version });
 
   if (roomState.playback.paused) {
     if (!player.paused) {
@@ -286,11 +334,13 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
     }
     if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
       withRemoteControl(() => setRemotePosition(player, expectedPosition));
+      startHlsLoadForState(roomState, expectedPosition);
     }
     player.playbackRate = 1;
   } else {
     if (absoluteError > HARD_SYNC_THRESHOLD_SEC || player.paused) {
       withRemoteControl(() => setRemotePosition(player, expectedPosition));
+      startHlsLoadForState(roomState, expectedPosition);
     } else if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
       player.playbackRate = error > 0 ? 1.04 : 0.96;
       resetPlaybackRate(player);
@@ -302,6 +352,14 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
     logSyncEvent("Room timeline applied", { version: roomState.version, errorMs: state.lastSyncErrorMs });
   }
   setPlaybackState();
+}
+
+function startHlsLoadForState(roomState, positionSec) {
+  if (roomState.media?.kind !== "hls" || !state.hls || state.lastHlsLoadVersion === roomState.version) {
+    return;
+  }
+  state.lastHlsLoadVersion = roomState.version;
+  state.hls.startLoad(positionSec);
 }
 
 function resetPlaybackRate(player) {
@@ -343,16 +401,14 @@ function setRemotePosition(player, positionSec) {
   player.currentTime = positionSec;
 }
 
-function shouldPublishLocalEvent() {
-  return !state.isApplyingRemoteEvent && Boolean(state.roomState?.media);
-}
-
 function unloadSource() {
   const player = elements.player;
   state.hls?.destroy();
   state.hls = null;
+  state.lastHlsRecoveryAt = 0;
+  state.lastHlsLoadVersion = null;
+  state.mediaBuffering = false;
   state.sourceId = null;
-  state.localSeekActive = false;
   if (!player) {
     return;
   }
@@ -388,17 +444,17 @@ function loadSource(media) {
     return;
   }
 
-  if (window.Hls?.isSupported()) {
-    const hls = new window.Hls({ backBufferLength: 30, lowLatencyMode: false });
+  if (Hls.isSupported()) {
+    const hls = new Hls({ backBufferLength: 30, lowLatencyMode: false });
     state.hls = hls;
-    hls.on(window.Hls.Events.LEVEL_LOADED, (_event, data) => {
+    hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
       if (data.details.live) {
         hls.destroy();
         state.hls = null;
         logSyncEvent("Unsupported HLS source", "Live HLS is not supported in synchronized rooms.");
       }
     });
-    hls.on(window.Hls.Events.ERROR, (_event, data) => handleHlsError(hls, data));
+    hls.on(Hls.Events.ERROR, (_event, data) => handleHlsError(hls, data));
     hls.loadSource(media.url);
     hls.attachMedia(player);
     return;
@@ -414,16 +470,33 @@ function loadSource(media) {
 }
 
 function handleHlsError(hls, data) {
+  if (data.details === "bufferSeekOverHole" || data.details === "bufferNudgeOnStall") {
+    hls.startLoad();
+    logSyncEvent("HLS is correcting a buffer gap after the seek.");
+    return;
+  }
   if (!data.fatal) {
     return;
   }
-  if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
-    hls.recoverMediaError();
-    logSyncEvent("Recovering HLS decoder");
+  if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+    const now = Date.now();
+    if (now - state.lastHlsRecoveryAt >= 5_000) {
+      state.lastHlsRecoveryAt = now;
+      hls.recoverMediaError();
+      logSyncEvent("Recovering HLS decoder at the shared position.");
+    } else {
+      const player = elements.player;
+      const targetPosition = player?.currentTime;
+      hls.stopLoad();
+      hls.detachMedia();
+      hls.attachMedia(player);
+      hls.startLoad(Number.isFinite(targetPosition) ? targetPosition : -1);
+      logSyncEvent("Restarting HLS decoder at the current position.");
+    }
     return;
   }
-  if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
-    logSyncEvent("HLS source could not load", "The source may have expired or blocked CORS.");
+  if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+    logSyncEvent("HLS segment loading failed after retries.");
     return;
   }
   logSyncEvent("HLS playback error", data.details || "Unknown HLS error");
@@ -454,13 +527,23 @@ function bindPlayerEvents() {
 
   player.addEventListener("loadedmetadata", () => synchronizePlayer("metadata"));
   player.addEventListener("canplay", () => synchronizePlayer("canplay"));
+  player.addEventListener("waiting", () => {
+    state.mediaBuffering = true;
+    state.remotePlayUntil = performance.now() + 60_000;
+    recordPlaybackEvent("waiting", player);
+    logSyncEvent("Buffering media at the shared position.");
+  });
+  player.addEventListener("playing", () => {
+    state.mediaBuffering = false;
+    state.remotePlayUntil = 0;
+    recordPlaybackEvent("playing", player);
+    logSyncEvent("Playing in sync.");
+  });
   player.addEventListener("seeking", () => {
-    if (shouldPublishLocalEvent() && !state.remoteSeek) {
-      state.localSeekActive = true;
-    }
+    recordPlaybackEvent("seeking", player);
   });
   player.addEventListener("seeked", () => {
-    state.localSeekActive = false;
+    recordPlaybackEvent("seeked", player);
     const remoteSeek = state.remoteSeek;
     const completedRemoteSeek = Boolean(
       remoteSeek &&
@@ -470,33 +553,31 @@ function bindPlayerEvents() {
     if (completedRemoteSeek || (remoteSeek && performance.now() > remoteSeek.expiresAt)) {
       state.remoteSeek = null;
     }
-    if (!completedRemoteSeek && shouldPublishLocalEvent()) {
-      sendAction({ positionSec: Math.max(0, player.currentTime), type: "seek" });
-    }
     synchronizePlayer("seeked");
   });
   player.addEventListener("play", () => {
-    const completedRemotePlay = performance.now() <= state.remotePlayUntil;
-    if (completedRemotePlay) {
+    if (performance.now() <= state.remotePlayUntil) {
       state.remotePlayUntil = 0;
-    }
-    if (!completedRemotePlay && shouldPublishLocalEvent()) {
-      sendAction({ type: "play" });
     }
     setPlaybackState();
   });
   player.addEventListener("pause", () => {
-    if (shouldPublishLocalEvent()) {
-      sendAction({ type: "pause" });
-    }
     setPlaybackState();
   });
   player.addEventListener("error", () => {
-    const message = player.error?.message || "The media element could not load this source.";
-    logSyncEvent("Media playback error", message);
-  });
-  player.addEventListener("pointerdown", () => {
-    state.playbackBlocked = false;
+    const details = {
+      code: player.error?.code ?? null,
+      message: player.error?.message || null,
+      currentTime: player.currentTime,
+      readyState: player.readyState,
+      networkState: player.networkState
+    };
+    console.warn("[Sync] Media playback error", details);
+    if (state.roomState?.media?.kind === "hls" && state.hls && player.error?.code === 3) {
+      handleHlsError(state.hls, { fatal: true, type: Hls.ErrorTypes.MEDIA_ERROR, details: "mediaError" });
+      return;
+    }
+    logSyncEvent("Media playback error", details);
   });
 }
 
@@ -516,11 +597,25 @@ window.anyTogetherSyncBridge = {
   loadMedia(url, forceReload = false) {
     return loadInterfaceMedia(url, forceReload);
   },
+  play() {
+    state.playbackBlocked = false;
+    return sendAction({ type: "play" });
+  },
+  pause() {
+    return sendAction({ type: "pause" });
+  },
   seek(positionSec) {
     const position = Number(positionSec);
     if (!Number.isFinite(position) || position < 0) {
       return false;
     }
+    if (!state.roomState) {
+      return false;
+    }
+    state.pendingSeek = {
+      baseVersion: state.roomState.version,
+      positionSec: position
+    };
     return sendAction({ positionSec: position, type: "seek" });
   }
 };
@@ -540,10 +635,27 @@ window.__getPlaybackPipelineState = () => ({
   hlsActive: Boolean(state.hls),
   mediaUrl: state.roomState?.media?.url || "",
   paused: state.roomState?.playback?.paused ?? true,
+  positionSec: state.roomState ? getPositionAt(state.roomState, estimateServerNow()) : null,
   ready: Boolean(elements.player && elements.player.readyState >= HTMLMediaElement.HAVE_METADATA),
   roomId: state.roomId,
   version: state.roomState?.version ?? null
 });
+window.__getPlaybackEvents = () => state.playbackEvents.slice();
+window.__disconnectPlaybackSocket = () => {
+  if (!state.connection) {
+    return false;
+  }
+  state.connection.close(4_000, "E2E reconnect check");
+  return true;
+};
+window.__getSyncDiagnostics = () => {
+  try {
+    const entries = JSON.parse(localStorage.getItem(DIAGNOSTIC_STORAGE_KEY) || "[]");
+    return Array.isArray(entries) ? entries : [];
+  } catch {
+    return [];
+  }
+};
 
 bindPlayerEvents();
 window.setInterval(() => {

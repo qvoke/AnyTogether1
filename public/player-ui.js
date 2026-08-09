@@ -1,10 +1,8 @@
 /**
- * Кастомный overlay-UI для hls.js плеера в стиле video.js
- * Работает поверх существующего hls.js из app.js
- * Предоставляет: play/pause, прогресс-бар, громкость, время, качество, PiP, fullscreen
+ * Custom video.js-inspired controls for the synchronized Hls.js player.
  */
 
-// ========== Элементы ==========
+// Player elements
 const video = document.getElementById('player');
 const shell = video?.closest('.player-shell') || video?.parentElement;
 
@@ -36,10 +34,10 @@ let _isDragging = false;
 let _isVolumeDragging = false;
 let _menuOpen = false;
 
-// Для временных значков play/pause
+// Transient play and pause indicators
 let _actionIconTimer = null;
 
-// ========== Создание контролов ==========
+// Control creation
 function createControls() {
   if (UI.controls || !shell || !video) return;
 
@@ -50,8 +48,8 @@ function createControls() {
       <button class="ctrl-btn play-btn" title="Play/Pause">
         <svg viewBox="0 0 24 24" width="20" height="20"><polygon points="6,4 20,12 6,20" fill="currentColor"/></svg>
       </button>
-      <button class="ctrl-btn skip-btn skip-back-btn" title="Back 10 seconds"><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8a8 8 0 1 1-1 7M5 4v4h4"/></svg></span></button>
-      <button class="ctrl-btn skip-btn skip-forward-btn" title="Forward 10 seconds"><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8a8 8 0 1 0 1 7M19 4v4h-4"/></svg></span></button>
+      <button class="ctrl-btn skip-btn skip-back-btn" title="Back 5 seconds"><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8a8 8 0 1 1-1 7M5 4v4h4"/></svg></span></button>
+      <button class="ctrl-btn skip-btn skip-forward-btn" title="Forward 5 seconds"><span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8a8 8 0 1 0 1 7M19 4v4h-4"/></svg></span></button>
       <div class="volume-container">
         <button class="ctrl-btn volume-btn" title="Mute">
           <svg viewBox="0 0 24 24" width="20" height="20">
@@ -109,14 +107,14 @@ function createControls() {
   UI.settingsBtn = div.querySelector('.settings-btn');
   UI.fullscreenBtn = div.querySelector('.fullscreen-btn');
 
-  // Создаём спиннер загрузки по центру
+  // The spinner remains independent from browser-native controls.
   const spinner = document.createElement('div');
   spinner.className = 'player-center-spinner';
   spinner.innerHTML = `<svg viewBox="0 0 50 50" width="40" height="40"><circle cx="25" cy="25" r="20" fill="none" stroke="rgba(255,255,255,0.5)" stroke-width="4" stroke-dasharray="100" stroke-linecap="round"><animateTransform attributeName="transform" type="rotate" from="0 25 25" to="360 25 25" dur="1s" repeatCount="indefinite"/></circle></svg>`;
   shell.appendChild(spinner);
   UI.centerSpinner = spinner;
 
-  // Создаём центральный overlay для временных значков
+  // This overlay keeps transient feedback above the video surface.
   const overlay = document.createElement('div');
   overlay.className = 'player-center-overlay';
   overlay.innerHTML = `<div class="center-icon"></div>`;
@@ -126,28 +124,28 @@ function createControls() {
   bindEvents();
 }
 
-// ========== События ==========
+// Control events
 function bindEvents() {
   if (!video) return;
 
   // Play/Pause
   UI.playBtn.addEventListener('click', () => {
     if (video.paused) {
-      video.play().catch(() => {});
+      window.anyTogetherSyncBridge?.play();
       showCenterIcon('play');
     } else {
-      video.pause();
+      window.anyTogetherSyncBridge?.pause();
       showCenterIcon('pause');
     }
   });
 
-  // Нажатие на сам video центральной области для play/pause
+  // Clicking the video follows the same authoritative command path as the button.
   video.addEventListener('click', () => {
     if (video.paused) {
-      video.play().catch(() => {});
+      window.anyTogetherSyncBridge?.play();
       showCenterIcon('play');
     } else {
-      video.pause();
+      window.anyTogetherSyncBridge?.pause();
       showCenterIcon('pause');
     }
   });
@@ -169,9 +167,9 @@ function bindEvents() {
   function seekFromMouse(e) {
     const rect = UI.progressBar.getBoundingClientRect();
     const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    // Мгновенно двигаем fill и handle, не дожидаясь timeupdate видео
+    // Immediate visual feedback prevents a delayed media event from making the control feel stuck.
     setProgressVisual(pct);
-    if (video.duration) video.currentTime = pct * video.duration;
+    if (video.duration) window.anyTogetherSyncBridge?.seek(pct * video.duration);
   }
 
   // Volume
@@ -195,11 +193,32 @@ function bindEvents() {
   });
 
   UI.skipBackBtn.addEventListener('click', () => {
-    video.currentTime = Math.max(0, (video.currentTime || 0) - 10);
+    window.anyTogetherSyncBridge?.seek(Math.max(0, (video.currentTime || 0) - 5));
   });
   UI.skipForwardBtn.addEventListener('click', () => {
     const duration = Number.isFinite(video.duration) ? video.duration : Infinity;
-    video.currentTime = Math.min(duration, (video.currentTime || 0) + 10);
+    window.anyTogetherSyncBridge?.seek(Math.min(duration, (video.currentTime || 0) + 5));
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || isEditableTarget(event.target)) {
+      return;
+    }
+    if (event.code === 'Space') {
+      event.preventDefault();
+      if (video.paused) {
+        window.anyTogetherSyncBridge?.play();
+      } else {
+        window.anyTogetherSyncBridge?.pause();
+      }
+    } else if (event.code === 'ArrowLeft') {
+      event.preventDefault();
+      window.anyTogetherSyncBridge?.seek(Math.max(0, (video.currentTime || 0) - 5));
+    } else if (event.code === 'ArrowRight') {
+      event.preventDefault();
+      const duration = Number.isFinite(video.duration) ? video.duration : Infinity;
+      window.anyTogetherSyncBridge?.seek(Math.min(duration, (video.currentTime || 0) + 5));
+    }
   });
 
   // Settings
@@ -225,13 +244,13 @@ function bindEvents() {
   video.addEventListener('timeupdate', updateTime);
   video.addEventListener('loadedmetadata', () => {
     updateTime();
-    // Сбрасываем прогресс-бар и время при загрузке нового видео
+    // A source change must not display timing information from the previous media.
     setProgressVisual(0);
     if (UI.currentTime) UI.currentTime.textContent = '00:00';
   });
   video.addEventListener('durationchange', () => {
     updateTime();
-    // При смене длительности (новый источник) сбрасываем прогресс
+    // Duration changes can arrive before the source change event in Chromium.
     setProgressVisual(0);
   });
   video.addEventListener('timeupdate', updateProgress);
@@ -254,7 +273,7 @@ function bindEvents() {
   // Fullscreen change
   document.addEventListener('fullscreenchange', onFullscreenChange);
 
-  // Закрытие панели настроек при клике вне
+  // Dismiss settings when focus moves outside the player controls.
   document.addEventListener('click', (e) => {
     if (_menuOpen && !e.target.closest('.quality-menu-overlay') && !e.target.closest('.settings-btn')) {
       closeMenu();
@@ -267,7 +286,16 @@ function bindEvents() {
   });
 }
 
-// ========== Временный значок по центру ==========
+function isEditableTarget(target) {
+  return target instanceof HTMLElement && (
+    target.isContentEditable ||
+    target.tagName === 'INPUT' ||
+    target.tagName === 'TEXTAREA' ||
+    target.tagName === 'SELECT'
+  );
+}
+
+// Transient center indicator
 function showCenterIcon(type) {
   if (!UI.centerOverlay) return;
   const iconEl = UI.centerOverlay.querySelector('.center-icon');
@@ -288,7 +316,7 @@ function showCenterIcon(type) {
   }, 500);
 }
 
-// ========== Обновление fill/handle вручную (без timeupdate) ==========
+// Immediate progress rendering
 function setProgressVisual(pct) {
   if (!UI.progressFill || !UI.progressHandle) return;
   const wpct = Math.min(100, pct * 100);
@@ -296,7 +324,7 @@ function setProgressVisual(pct) {
   UI.progressHandle.style.left = `${wpct}%`;
 }
 
-// ========== Обновление UI ==========
+// Player rendering
 function updateTime() {
   if (!video) return;
   const cur = fmt(video.currentTime || 0);
@@ -311,14 +339,12 @@ function updateProgress() {
   UI.progressFill.style.width = `${pct}%`;
   UI.progressHandle.style.left = `${pct}%`;
 
-  // Когда пользователь тянет ползунок (seeking), цвет fill уже установлен,
-  // но если видео не загрузилось — fill не двигается. А handle уже на нужной позиции.
-  // Цвет fill'а будет восстановлен при воспроизведении.
+  // Preserve the requested handle position while the media pipeline resolves a seek.
 }
 
 function updateBuffer() {
   if (!video || !video.duration || !UI.bufferFill) return;
-  // bufferFill: показываем буферизированную часть (от 0 до buffered.end)
+  // Only the contiguous buffered range is useful for the compact progress display.
   try {
     const b = video.buffered;
     if (b.length > 0) {
@@ -349,11 +375,10 @@ function updatePlayBtn() {
     : '<svg viewBox="0 0 24 24" width="20" height="20"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>';
 }
 
-// Экспорт функции для app.js для принудительного обновления при загрузке нового источника
+// The playback engine calls this after replacing a source.
 window.__updatePlayButton = updatePlayBtn;
 
-// Восстановление позиции при смене качества — обрабатывается в app.js
-// через _qualityChangePendingTime и restoreQualitySeek
+// Quality switches preserve position through the playback engine.
 
 function onFullscreenChange() {
   if (!shell) return;
@@ -371,10 +396,9 @@ function fmt(s) {
   return `${String(m).padStart(2, '0')}:${ss}`;
 }
 
-// Панель настроек (Speed, Quality, PiP) — используется встроенная #playerSettingsPanel из HTML
-// Логика открытия/закрытия и навигации — в app.js (toggleSettingsPanel, showMainMenu и т.д.)
+// The settings panel remains owned by the existing interface module.
 
-// ========== Инициализация ==========
+// Initialization
 let _initDone = false;
 function initOnce() {
   if (_initDone) return;

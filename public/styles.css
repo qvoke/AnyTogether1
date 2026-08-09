@@ -1106,6 +1106,11 @@ select:focus {
   border-radius: 20px;
 }
 
+.player-shell.is-media-loading,
+.player-shell.is-media-loading video {
+  background: #000;
+}
+
 .player-shell video::-webkit-media-controls-panel {
   background: linear-gradient(0deg, rgba(0, 0, 0, 0.85), transparent);
 }
