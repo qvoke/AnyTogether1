@@ -79,17 +79,25 @@ Run the room connection smoke test:
 npm run test:e2e
 ```
 
-Set a public CORS-enabled MP4 or HLS VOD source to also verify media loading,
-play, seek, and pause across two isolated browser contexts:
+`tests/e2e.config.json` contains the media source for the complete media,
+play, seek, and pause check. Replace `mediaUrl` there with a public
+CORS-enabled MP4 or HLS VOD source when it expires.
 
 ```powershell
-$env:E2E_MEDIA_URL = "https://cdn.example.com/video.mp4"
 npm run test:e2e:watch
 ```
 
 `test:e2e:watch` opens the browser so the synchronization can be observed.
 Set `E2E_BASE_URL` to run the same suite against a deployed instance instead
-of starting a local server.
+of starting a local server. By default the suite starts its own server on port
+3100. Set `E2E_REUSE_SERVER=1` only to deliberately reuse a server already
+running on that port. `E2E_MEDIA_URL` remains available as a one-time media
+source override. Remove `E2E_BASE_URL` from the shell environment to return to
+the local server:
+
+```powershell
+Remove-Item Env:E2E_BASE_URL -ErrorAction SilentlyContinue
+```
 
 ## Site and extension bridge
 

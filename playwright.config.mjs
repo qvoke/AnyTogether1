@@ -3,6 +3,7 @@ import { defineConfig, devices } from "@playwright/test";
 const externalBaseUrl = process.env.E2E_BASE_URL;
 const localPort = Number(process.env.E2E_PORT || 3100);
 const localBaseUrl = `http://127.0.0.1:${localPort}`;
+const reuseExistingServer = process.env.E2E_REUSE_SERVER === "1";
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -27,7 +28,7 @@ export default defineConfig({
           ANYTOGETHER_DATA_DIR: ".notes/build-codex/e2e-data",
           PORT: String(localPort)
         },
-        reuseExistingServer: true,
+        reuseExistingServer,
         timeout: 120_000,
         url: `${localBaseUrl}/`
       }

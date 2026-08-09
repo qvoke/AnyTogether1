@@ -5,8 +5,13 @@ const config = JSON.parse(readFileSync(new URL("../e2e.config.json", import.meta
 
 async function createRoom(request) {
   const response = await request.post("/api/rooms", { data: { title: "E2E synchronization room" } });
-  expect(response.ok()).toBeTruthy();
-  return (await response.json()).room.code;
+  if (!response.ok()) {
+    throw new Error(`Unable to create an E2E room at ${response.url()}: HTTP ${response.status()} ${await response.text()}`);
+  }
+
+  const payload = await response.json();
+  expect(payload.room?.code).toEqual(expect.any(String));
+  return payload.room.code;
 }
 
 async function openRoom(browser, roomId) {
