@@ -60,15 +60,20 @@ async function waitForMedia(page, mediaUrl) {
   }).toBe(true);
 }
 
+async function playbackSamples(pages) {
+  return Promise.all(pages.map((page) => page.locator("#player").evaluate((video) => ({
+    currentTime: video.currentTime,
+    paused: video.paused,
+    ended: video.ended,
+    readyState: video.readyState
+  }))));
+}
+
 async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncLog = null, persistSyncLog = null) {
   let finalSamples = [];
   const synchronizationStartedAt = Date.now();
   await expect.poll(async () => {
-    const samples = await Promise.all([pageA, pageB].map((page) => page.locator("#player").evaluate((video) => ({
-      currentTime: video.currentTime,
-      paused: video.paused,
-      readyState: video.readyState
-    }))));
+    const samples = await playbackSamples([pageA, pageB]);
     finalSamples = samples;
     if (samples.some((sample) => sample.readyState < 1 || sample.paused)) {
       return false;
@@ -83,9 +88,17 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
   }, { intervals: [100, 250, 500, 1_000], timeout: 30_000 }).toBe(true);
 
   const settleMs = Math.max(0, Number(config.playbackSettleMs) || 0);
+  const settleStartSamples = await playbackSamples([pageA, pageB]);
   if (settleMs > 0) {
     await pageA.waitForTimeout(settleMs);
   }
+  const settleEndSamples = await playbackSamples([pageA, pageB]);
+  const progressDeltaSec = settleEndSamples.map((sample, index) => (
+    sample.currentTime - settleStartSamples[index].currentTime
+  ));
+  const hangDetected = settleMs >= 500 && settleStartSamples.some((sample, index) => (
+    !sample.paused && !sample.ended && progressDeltaSec[index] < 0.25
+  ));
 
   if (syncLog) {
     syncLog.push({
@@ -94,12 +107,16 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
       settledAfterMs: settleMs,
       totalWaitMs: Date.now() - synchronizationStartedAt,
       samples: finalSamples.map(({ currentTime, readyState }) => ({ currentTime, readyState })),
-      deltaMs: Math.round(Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000)
+      deltaMs: Math.round(Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000),
+      progressDeltaSec,
+      hangDetected
     });
     if (persistSyncLog) {
       await persistSyncLog();
     }
   }
+
+  expect(hangDetected, `Playback stalled during the ${settleMs} ms settle window`).toBe(false);
 }
 
 async function togglePlayback(page) {

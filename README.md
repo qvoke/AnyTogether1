@@ -106,6 +106,10 @@ the local server:
 Remove-Item Env:E2E_BASE_URL -ErrorAction SilentlyContinue
 ```
 
+The generated sync log records `progressDeltaSec` for both videos and marks
+each checkpoint with `hangDetected` when a playing video fails to advance
+during the settle window.
+
 ## Site and extension bridge
 
 The page sends a search request with `window.postMessage`:
