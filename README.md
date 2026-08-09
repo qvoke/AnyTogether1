@@ -88,7 +88,8 @@ The remaining E2E command settings mirror the seektest configuration:
 count, `seekMode` chooses `manual` or deterministic `random` positions,
 `seekCount` sets the number of seeks, `seekPositionsSec` supplies manual
 positions, `randomSeed` controls random replayability, `playbackSettleMs`
-waits after clocks converge, and `holdMs` keeps the final playback running.
+waits after clocks converge, `loadingTimeoutMs` aborts a checkpoint that stays
+loading or fails to converge, and `holdMs` keeps the final playback running.
 
 ```powershell
 npm run test:e2e:watch

@@ -12,6 +12,10 @@ function createRandom(seed) {
   };
 }
 
+function loadingTimeoutMs() {
+  return Math.max(1_000, Number(config.loadingTimeoutMs) || 5_000);
+}
+
 async function createRoom(request) {
   const response = await request.post("/api/rooms", { data: { title: "E2E synchronization room" } });
   if (!response.ok()) {
@@ -55,9 +59,13 @@ async function waitForMedia(page, mediaUrl) {
     const state = await pipelineState(page);
     return state?.version === 1 && state.mediaUrl === mediaUrl;
   }, { timeout: 30_000 }).toBe(true);
-  await expect.poll(() => page.locator("#player").evaluate((video) => video.readyState >= 2), {
-    timeout: 30_000
-  }).toBe(true);
+  try {
+    await expect.poll(() => page.locator("#player").evaluate((video) => video.readyState >= 2), {
+      timeout: loadingTimeoutMs()
+    }).toBe(true);
+  } catch (error) {
+    throw new Error(`Media loading exceeded ${loadingTimeoutMs()} ms`, { cause: error });
+  }
 }
 
 async function playbackSamples(pages) {
@@ -70,15 +78,20 @@ async function playbackSamples(pages) {
 }
 
 async function waitForPlayableMedia(pageA, pageB) {
-  await expect.poll(async () => {
-    const samples = await playbackSamples([pageA, pageB]);
-    return samples.every((sample) => sample.readyState >= 2);
-  }, { intervals: [100, 250, 500, 1_000], timeout: 30_000 }).toBe(true);
+  try {
+    await expect.poll(async () => {
+      const samples = await playbackSamples([pageA, pageB]);
+      return samples.every((sample) => sample.readyState >= 2);
+    }, { intervals: [100, 250, 500, 1_000], timeout: loadingTimeoutMs() }).toBe(true);
+  } catch (error) {
+    throw new Error(`Media remained loading for ${loadingTimeoutMs()} ms before seek`, { cause: error });
+  }
 }
 
 async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncLog = null, persistSyncLog = null) {
   let finalSamples = [];
   const synchronizationStartedAt = Date.now();
+  const convergenceTimeoutMs = loadingTimeoutMs();
   try {
     await expect.poll(async () => {
       const samples = await playbackSamples([pageA, pageB]);
@@ -94,7 +107,7 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
       }
       const expectedPositionAtSample = expectedPosition + (Date.now() - synchronizationStartedAt) / 1_000;
       return samples.every((sample) => Math.abs(sample.currentTime - expectedPositionAtSample) < 1.5);
-    }, { intervals: [100, 250, 500, 1_000], timeout: 30_000 }).toBe(true);
+    }, { intervals: [100, 250, 500, 1_000], timeout: convergenceTimeoutMs }).toBe(true);
   } catch (error) {
     if (syncLog) {
       syncLog.push({
@@ -108,13 +121,14 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
           : null,
         progressDeltaSec: [],
         hangDetected: false,
-        convergenceTimedOut: true
+        convergenceTimedOut: true,
+        timeoutMs: convergenceTimeoutMs
       });
       if (persistSyncLog) {
         await persistSyncLog();
       }
     }
-    throw error;
+    throw new Error(`Playback convergence exceeded ${convergenceTimeoutMs} ms`, { cause: error });
   }
 
   const settleMs = Math.max(0, Number(config.playbackSettleMs) || 0);
