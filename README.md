@@ -2,9 +2,9 @@
 
 AnyTogether is a synchronized media room interface with:
 
-- Intent-based WebSocket playback sync for `load`, `play`, `pause`, and `seek`
-- A short hidden control lease so only one client drives the room at a time
-- Shaka Player UI playback for MP4/HLS streams with a built-in quality menu
+- An authoritative, versioned room timeline for media, play, pause, and seek actions
+- Server-time synchronization with local drift correction and automatic reconnection
+- Native MP4 playback and Hls.js playback for public HLS VOD sources
 - A plugin bridge that delivers metasearch results into the page
 
 ## Run locally
@@ -16,40 +16,54 @@ npm run dev
 
 The server always starts at `http://localhost:3000`.
 
-## Playback sync
+## Playback synchronization
 
-Clients send explicit intents, and the server turns them into room snapshots:
+The server owns each room timeline. Clients submit versioned actions through a
+room-specific WebSocket and apply the returned snapshot against the server
+clock. This prevents one browser's buffering, latency, or local playback clock
+from becoming the source of truth.
 
 ```json
 {
-  "type": "player-intent",
-  "action": "seek",
-  "actionId": "2d42e7c1-4f3c-4f91-b6a7-1d0b9b2d7a26",
-  "roomId": "lobby",
-  "clientId": "host-1",
-  "currentTime": 42.5,
-  "paused": true
+  "type": "action",
+  "action": {
+    "type": "seek",
+    "actionId": "2d42e7c1-4f3c-4f91-b6a7-1d0b9b2d7a26",
+    "knownVersion": 7,
+    "mediaId": "b12f143f-f662-40ac-bb8a-c80600e2dafe",
+    "positionSec": 42.5
+  }
 }
 ```
 
 ```json
 {
-  "type": "player-intent",
-  "action": "load",
-  "actionId": "9df2c8e6-76c8-4f50-8d0b-9f7cb12c48bc",
-  "roomId": "lobby",
-  "clientId": "host-1",
-  "mediaUrl": "https://example.com/stream.m3u8",
-  "currentTime": 0,
-  "paused": false
+  "type": "snapshot",
+  "serverTimeMs": 1765658385000,
+  "state": {
+    "version": 8,
+    "media": {
+      "id": "b12f143f-f662-40ac-bb8a-c80600e2dafe",
+      "kind": "hls",
+      "url": "https://example.com/stream.m3u8"
+    },
+    "playback": {
+      "anchorPositionSec": 42.5,
+      "anchorServerTimeMs": 1765658385000,
+      "paused": false
+    }
+  }
 }
 ```
 
-The room snapshot includes the current media state plus controller metadata so clients can log
-lease changes and apply the latest room state safely.
+Only public HTTPS MP4 and HLS VOD URLs are accepted. Video remains on its
+original host; the room sends only a URL and small synchronization messages.
 
-A `seek` intent can carry `paused` when a rapid seek and pause should be committed as one
-atomic room update.
+Run the synchronization checks with:
+
+```bash
+npm run test:sync
+```
 
 ## Site and extension bridge
 
@@ -93,4 +107,4 @@ Use a simple pattern when inspecting request URLs for direct stream manifests:
 const streamPattern = /\.(?:m3u8|mp4)(?:\?|$)/i;
 ```
 
-Shaka Player UI exposes HLS quality switching through its built-in quality menu, and the interface keeps playback diagnostics visible in the room log.
+The interface keeps playback diagnostics visible in the room log.

@@ -4,19 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import crypto, { pbkdf2Sync, timingSafeEqual } from "node:crypto";
+import { RoomSyncService } from "./lib/room-sync.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
 const port = 3000;
-const controlLeaseMs = 1200;
-const playbackStatusMaxAgeMs = 2500;
-const playbackSyncToleranceMs = 100;
-const playbackSyncDisplayStepMs = 50;
-const playbackSyncActionWindowMs = 1500;
-const playbackSeekRecoveryWindowMs = 15000;
-const seekCommandInitialGraceMs = 700;
-const seekCommandStabilityMs = 1000;
 
 const dataDir = path.join(__dirname, "data");
 const roomStorePath = path.join(dataDir, "rooms.json");
@@ -31,23 +24,17 @@ const contentTypes = new Map([
   [".ico", "image/x-icon"]
 ]);
 
-const defaultPlaybackSnapshot = {
-  mediaUrl: "",
-  currentTime: 0,
-  paused: true,
-  playbackRate: 1,
-  volume: 1,
-  muted: false
-};
-
 const rooms = new Map();
 const roomMembers = new Map();
-const playbackSeriesContextSignatures = new Map();
 const socketState = new Map();
 const participantOfflineTimers = new WeakMap();
 const connectedSockets = new Set();
 const usersById = new Map();
 const sessionsByToken = new Map();
+const roomSync = new RoomSyncService({
+  dataDir,
+  isRoomId: (roomId) => normalizeRoomCode(roomId) === roomId
+});
 
 let persistTimer = null;
 let authPersistTimer = null;
@@ -121,19 +108,7 @@ function createRoom(roomId, title = null, ownerId = null) {
       updatedAt: createdAt
     },
     participants: [],
-    loadedFromDisk: false,
-
-    revision: 0,
-    snapshot: null,
-    pendingPlayIntent: null,
-    clients: new Set(),
-    control: {
-      clientId: null,
-      name: "",
-      role: "",
-      leaseUntil: 0,
-      actionId: null
-    }
+    loadedFromDisk: false
   };
 }
 
@@ -206,27 +181,6 @@ function getSocketState(socket) {
   return socketState.get(socket);
 }
 
-function serializeControl(room) {
-  if (!room.control.clientId) {
-    return null;
-  }
-
-  return {
-    ...room.control
-  };
-}
-
-function serializeSnapshot(room) {
-  if (!room.snapshot) {
-    return null;
-  }
-
-  return {
-    ...room.snapshot,
-    control: serializeControl(room)
-  };
-}
-
 function sendJson(responseOrSocket, statusCodeOrPayload, payloadIfResponse = null) {
   if (typeof responseOrSocket.writeHead === "function") {
     responseOrSocket.writeHead(statusCodeOrPayload, { "Content-Type": "application/json; charset=utf-8" });
@@ -236,367 +190,6 @@ function sendJson(responseOrSocket, statusCodeOrPayload, payloadIfResponse = nul
       responseOrSocket.send(JSON.stringify(statusCodeOrPayload));
     }
   }
-}
-
-function broadcast(room, payload, exceptSocket = null) {
-  for (const client of room.clients) {
-    if (client === exceptSocket || client.readyState !== 1) {
-      continue;
-    }
-
-    client.send(JSON.stringify(payload));
-  }
-}
-
-function replaceClientConnection(room, socket) {
-  const clientId = socket.context?.clientId;
-  if (!clientId) {
-    room.clients.add(socket);
-    return;
-  }
-
-  for (const existingSocket of room.clients) {
-    if (existingSocket.context?.clientId !== clientId) continue;
-    room.clients.delete(existingSocket);
-    if (existingSocket.readyState === 0 || existingSocket.readyState === 1) {
-      existingSocket.close(4001, "Replaced by reconnect");
-    }
-  }
-
-  room.clients.add(socket);
-}
-
-function createRoomStatePayload(room) {
-  return {
-    type: "room-snapshot",
-    roomId: room.roomId,
-    revision: room.revision,
-    snapshot: serializeSnapshot(room)
-  };
-}
-
-function getClientPlaybackState(room, context) {
-  const playbackStatus = context?.playbackStatus;
-  const roomMediaUrl = room.snapshot?.mediaUrl || "";
-  if (
-    roomMediaUrl &&
-    (!playbackStatus || playbackStatus.mediaUrl !== roomMediaUrl || !playbackStatus.mediaReady)
-  ) {
-    return "loading";
-  }
-  if (playbackStatus?.buffering || playbackStatus?.applyingSeek) return "loading";
-  if (room.currentPlayback?.state === "paused") return "paused";
-  if (!playbackStatus || playbackStatus.paused) return "paused";
-  return "playing";
-}
-
-function createPresencePayload(room) {
-  return {
-    type: "presence",
-    roomId: room.roomId,
-    control: serializeControl(room),
-    members: Array.from(room.clients).map((client) => ({
-      clientId: client.context.clientId,
-      name: client.context.name,
-      role: client.context.role,
-      playbackState: getClientPlaybackState(room, client.context)
-    }))
-  };
-}
-
-function broadcastSeriesContextToPlayback(room, originId = null) {
-  if (!room?.currentMedia?.seriesContext) return;
-  const contextSignature = JSON.stringify(room.currentMedia.seriesContext);
-  if (playbackSeriesContextSignatures.get(room.roomId) === contextSignature) return;
-  playbackSeriesContextSignatures.set(room.roomId, contextSignature);
-  const serverSentAt = now();
-  broadcast(room, {
-    type: "series-context",
-    roomId: room.roomId,
-    pageUrl: room.currentMedia.pageUrl || null,
-    sourcePageUrl: room.currentMedia.sourcePageUrl || null,
-    title: room.currentMedia.title || room.currentMedia.seriesContext.title || null,
-    seriesContext: room.currentMedia.seriesContext,
-    originId,
-    serverSentAt
-  });
-}
-
-function projectPlaybackStatus(status, timestamp) {
-  if (!status || timestamp - status.receivedAt > playbackStatusMaxAgeMs) return null;
-
-  const elapsedSeconds = status.paused || status.buffering
-    ? 0
-    : Math.max(0, timestamp - status.receivedAt) / 1000;
-  return {
-    clientId: status.clientId,
-    currentTime: Math.max(0, status.currentTime + elapsedSeconds),
-    paused: status.paused,
-    buffering: status.buffering,
-    applyingSeek: status.applyingSeek,
-    mediaUrl: status.mediaUrl || "",
-    mediaReady: Boolean(status.mediaReady)
-  };
-}
-
-function refreshRoomSnapshotFromPlayback(room, timestamp = now()) {
-  if (!room.snapshot?.mediaUrl) return false;
-
-  const candidates = Array.from(room.clients)
-    .map((client) => client.context?.playbackStatus)
-    .filter((status) => {
-      const projected = projectPlaybackStatus(status, timestamp);
-      return projected &&
-        projected.mediaUrl === room.snapshot.mediaUrl &&
-        projected.mediaReady &&
-        !projected.applyingSeek;
-    });
-  if (!candidates.length) return false;
-
-  const controlledStatus = room.control.clientId
-    ? candidates.find((status) => status.clientId === room.control.clientId)
-    : null;
-  const status = controlledStatus || candidates.sort((left, right) => right.receivedAt - left.receivedAt)[0];
-  const projected = projectPlaybackStatus(status, timestamp);
-  if (!projected) return false;
-
-  room.snapshot.currentTime = projected.currentTime;
-  room.snapshot.paused = projected.paused;
-  room.snapshot.updatedAt = timestamp;
-  room.currentPlayback = {
-    state: projected.paused ? "paused" : "playing",
-    time: projected.currentTime,
-    updatedAt: timestamp
-  };
-  return true;
-}
-
-function createPlaybackSyncPayload(room) {
-  const timestamp = now();
-  const roomMediaUrl = room.snapshot?.mediaUrl || "";
-  const statuses = Array.from(room.clients)
-    .map((client) => projectPlaybackStatus(client.context.playbackStatus, timestamp))
-    .filter(Boolean);
-  const readyStatuses = statuses.filter((status) =>
-    status.mediaUrl === roomMediaUrl &&
-    status.mediaReady &&
-    !status.applyingSeek
-  );
-
-  const seekCommand = createSeekCommandPayload(room, timestamp);
-  let referenceClientId = seekCommand?.originClientId || null;
-  let referenceTime = seekCommand?.currentTime ?? null;
-  let referenceStatus = referenceClientId
-    ? statuses.find((status) => status.clientId === referenceClientId) || null
-    : null;
-  if (referenceTime === null && readyStatuses.length > 0) {
-    const reference = readyStatuses.reduce((latest, status) =>
-      status.currentTime > latest.currentTime ? status : latest
-    );
-    referenceClientId = reference.clientId;
-    referenceTime = reference.currentTime;
-    referenceStatus = reference;
-  }
-
-  referenceTime ??= Math.max(0, Number(room.snapshot?.currentTime) || 0);
-  const lastAction = room.snapshot?.lastAction;
-  const lastActionAt = Number(room.snapshot?.updatedAt) || 0;
-  const actionSyncActive = (lastAction === "seek" || lastAction === "pause") &&
-    timestamp - lastActionAt <= playbackSyncActionWindowMs;
-  return {
-    type: "playback-sync",
-    roomId: room.roomId,
-    mediaUrl: roomMediaUrl,
-    referenceClientId,
-    referencePaused: referenceStatus ? referenceStatus.paused : room.snapshot?.paused !== false,
-    referenceBuffering: readyStatuses.length === 0 ||
-      Boolean(
-        referenceStatus &&
-        (referenceStatus.buffering || referenceStatus.applyingSeek || !referenceStatus.mediaReady)
-      ),
-    seekActionId: seekCommand?.actionId || null,
-    offsets: statuses.map((status) => {
-      const rawAdjustmentMs = Math.round((referenceTime - status.currentTime) * 1000);
-      const rawOffsetMs = Math.abs(rawAdjustmentMs);
-      const offsetMs = rawOffsetMs <= playbackSyncToleranceMs
-        ? 0
-        : Math.round(rawOffsetMs / playbackSyncDisplayStepMs) * playbackSyncDisplayStepMs;
-      const adjustmentMs = rawOffsetMs <= playbackSyncToleranceMs
-        ? 0
-        : Math.sign(rawAdjustmentMs) * offsetMs;
-      const seekRecoveryActive = Boolean(room.lastSeekAt) &&
-        timestamp - room.lastSeekAt <= playbackSeekRecoveryWindowMs &&
-        rawOffsetMs > playbackSyncToleranceMs;
-      const statusUnavailable = status.mediaUrl !== roomMediaUrl ||
-        !status.mediaReady ||
-        status.applyingSeek;
-      const reason = status.buffering || statusUnavailable
-        ? "buffering"
-        : seekRecoveryActive || lastAction === "seek" && actionSyncActive
-          ? "seek"
-          : lastAction === "pause" && actionSyncActive
-            ? "pause"
-            : null;
-      return {
-        clientId: status.clientId,
-        currentTime: Number(status.currentTime.toFixed(3)),
-        referenceTime: Number(referenceTime.toFixed(3)),
-        rawOffsetMs,
-        offsetMs,
-        adjustmentMs,
-        buffering: status.buffering || statusUnavailable,
-        active: Boolean(reason),
-        reason
-      };
-    })
-  };
-}
-
-function broadcastPlaybackSync(room) {
-  broadcast(room, createPlaybackSyncPayload(room));
-}
-
-function createSeekCommandPayload(room, timestamp = now()) {
-  const command = room.pendingSeekCommand;
-  if (!command || timestamp - command.updatedAt > playbackSeekRecoveryWindowMs) return null;
-
-  const originClient = Array.from(room.clients).find(
-    (client) => client.context?.clientId === command.originClientId
-  );
-  const originStatus = projectPlaybackStatus(originClient?.context?.playbackStatus, timestamp);
-  const originReady = originStatus &&
-    originStatus.mediaReady &&
-    !originStatus.buffering &&
-    !originStatus.applyingSeek;
-  const previousReferenceTime = Number.isFinite(command.referenceTime)
-    ? command.referenceTime
-    : command.currentTime;
-  const currentTime = !command.paused && originReady
-    ? Math.max(previousReferenceTime, originStatus.currentTime)
-    : previousReferenceTime;
-  command.referenceTime = currentTime;
-  return {
-    type: "seek-command",
-    roomId: room.roomId,
-    actionId: command.actionId,
-    currentTime,
-    paused: command.paused,
-    originClientId: command.originClientId
-  };
-}
-
-function updateSeekCommandStability(context, actionId, reachedTarget, timestamp) {
-  if (context.seekCommandStabilityActionId !== actionId) {
-    context.seekCommandStabilityActionId = actionId;
-    context.seekCommandStableSince = 0;
-  }
-
-  if (!reachedTarget) {
-    context.seekCommandStableSince = 0;
-  } else if (!context.seekCommandStableSince) {
-    context.seekCommandStableSince = timestamp;
-  }
-}
-
-function completeSeekCommandWhenStable(room, command, timestamp) {
-  const commandStableForAll = Array.from(room.clients).every((client) => {
-    if (client.context.clientId === command.originClientId) return true;
-    return client.context.seekCommandStabilityActionId === command.actionId &&
-      Number.isFinite(client.context.seekCommandStableSince) &&
-      client.context.seekCommandStableSince > 0 &&
-      timestamp - client.context.seekCommandStableSince >= seekCommandStabilityMs;
-  });
-
-  if (commandStableForAll) {
-    room.pendingSeekCommand = null;
-    room.lastSeekClientId = null;
-    room.lastSeekAt = 0;
-  }
-
-  return commandStableForAll;
-}
-
-function retryPendingSeekForClient(room, socket, status, timestamp) {
-  const command = createSeekCommandPayload(room, timestamp);
-  if (!command) return;
-  const isOrigin = command.originClientId === socket.context.clientId;
-  const reachedTarget = Math.abs(command.currentTime - status.currentTime) * 1000 <= playbackSyncToleranceMs &&
-    !status.buffering &&
-    !status.applyingSeek;
-  if (!isOrigin) {
-    updateSeekCommandStability(socket.context, command.actionId, reachedTarget, timestamp);
-  }
-  if (completeSeekCommandWhenStable(room, command, timestamp)) return;
-  if (isOrigin) return;
-  if (reachedTarget) return;
-  if (status.buffering || status.applyingSeek) return;
-  if (timestamp - room.pendingSeekCommand.updatedAt < seekCommandInitialGraceMs) return;
-  const lastSentAt = Number(socket.context.lastSeekCommandSentAt) || 0;
-  if (socket.context.lastSeekCommandActionId === command.actionId && timestamp - lastSentAt < seekCommandInitialGraceMs) return;
-
-  socket.context.lastSeekCommandActionId = command.actionId;
-  socket.context.lastSeekCommandSentAt = timestamp;
-  sendJson(socket, command);
-}
-
-function syncRoomPlaybackState(room) {
-  if (room.snapshot) {
-    room.currentPlayback = {
-      state: room.snapshot.paused ? "paused" : "playing",
-      time: room.snapshot.currentTime,
-      updatedAt: now()
-    };
-    if (room.snapshot.mediaUrl) {
-      room.currentMedia = {
-        mediaUrl: room.snapshot.mediaUrl,
-        masterPlaylistUrl: room.currentMedia?.masterPlaylistUrl || null,
-        pageUrl: room.currentMedia?.pageUrl || null,
-        sourcePageUrl: room.currentMedia?.sourcePageUrl || null,
-        title: room.currentMedia?.title || null,
-        seriesContext: room.currentMedia?.seriesContext || null,
-        updatedAt: now()
-      };
-    }
-    room.lastUpdatedAt = now();
-  }
-}
-
-function resetRoomClientMediaReadiness(room) {
-  for (const client of room.clients) {
-    if (client.context?.playbackStatus) {
-      client.context.playbackStatus.mediaReady = false;
-    }
-  }
-}
-
-function resetRoomMediaLoadState(room) {
-  room.pendingSeekCommand = null;
-  room.pendingPlayIntent = null;
-  room.lastSeekClientId = null;
-  room.lastSeekAt = 0;
-  resetRoomClientMediaReadiness(room);
-}
-
-function syncRoomSnapshotFromUI(room, mediaUrl, paused = true, time = 0) {
-  resetRoomMediaLoadState(room);
-  room.snapshot = room.snapshot || {
-    mediaUrl: "",
-    currentTime: 0,
-    paused: true,
-    playbackRate: 1,
-    volume: 1,
-    muted: false
-  };
-
-  room.snapshot.mediaUrl = mediaUrl || "";
-  room.snapshot.paused = paused;
-  room.snapshot.currentTime = time;
-  room.revision += 1;
-  room.snapshot.revision = room.revision;
-  room.snapshot.updatedAt = now();
-  room.snapshot.lastAction = "load";
-  room.snapshot.lastActionId = crypto.randomUUID();
-  room.lastUpdatedAt = now();
 }
 
 function broadcastToUiSockets(sockets, payload) {
@@ -711,15 +304,6 @@ function normalizePersistedRoom(roomData) {
   }
 
   room.lastUpdatedAt = Number.isFinite(roomData?.lastUpdatedAt) ? roomData.lastUpdatedAt : room.createdAt;
-
-  room.snapshot = {
-    mediaUrl: room.currentMedia?.mediaUrl || "",
-    currentTime: room.currentPlayback?.time || 0,
-    paused: room.currentPlayback?.state === "paused",
-    playbackRate: 1,
-    volume: 1,
-    muted: false
-  };
 
   return room;
 }
@@ -1559,7 +1143,7 @@ async function handleApiRequest(request, response, url) {
     }
 
     rooms.delete(roomCode);
-    playbackSeriesContextSignatures.delete(roomCode);
+    roomSync.delete(roomCode);
     if (user) {
       detachRoomFromUser(user.id, roomCode);
     }
@@ -1612,290 +1196,6 @@ async function serveStatic(request, response) {
   }
 }
 
-function clampCurrentTime(value) {
-  if (!Number.isFinite(value)) {
-    return 0;
-  }
-
-  return Math.max(0, value);
-}
-
-function isRoomMediaReady(room, timestamp = now()) {
-  const mediaUrl = room.snapshot?.mediaUrl || "";
-  if (!mediaUrl || room.clients.size === 0) return false;
-  return Array.from(room.clients).every((client) => {
-    const status = client.context?.playbackStatus;
-    return status?.mediaUrl === mediaUrl &&
-      status.mediaReady === true &&
-      timestamp - status.receivedAt <= playbackStatusMaxAgeMs;
-  });
-}
-
-function queuePendingRoomPlay(room, context, message, actionId, requestedAt) {
-  room.pendingPlayIntent = {
-    actionId,
-    originClientId: context.clientId,
-    currentTime: clampCurrentTime(message.currentTime),
-    playbackRate: message.playbackRate,
-    volume: message.volume,
-    muted: message.muted,
-    requestedAt
-  };
-}
-
-function releasePendingRoomPlay(room, timestamp = now()) {
-  const pending = room.pendingPlayIntent;
-  if (!pending || !isRoomMediaReady(room, timestamp)) return false;
-  const originSocket = Array.from(room.clients).find(
-    (client) => client.context?.clientId === pending.originClientId
-  );
-  const context = originSocket?.context || Array.from(room.clients)[0]?.context;
-  if (!context) return false;
-
-  room.pendingPlayIntent = null;
-  const result = applyPlayerIntent(room, context, {
-    action: "play",
-    actionId: pending.actionId,
-    currentTime: pending.currentTime,
-    playbackRate: pending.playbackRate,
-    volume: pending.volume,
-    muted: pending.muted,
-    mediaReadyRelease: true
-  }, timestamp);
-  if (!result.accepted) return false;
-  broadcast(room, createRoomStatePayload(room));
-  broadcast(room, createPresencePayload(room));
-  broadcastPlaybackSync(room);
-  return true;
-}
-
-function setPendingTimelineCommand(room, context, actionId, snapshot, updatedAt) {
-  room.pendingSeekCommand = {
-    actionId,
-    currentTime: snapshot.currentTime,
-    referenceTime: snapshot.currentTime,
-    paused: snapshot.paused,
-    originClientId: context.clientId,
-    updatedAt
-  };
-}
-
-function applyPlayerIntent(room, context, message, nowVal) {
-  const action = typeof message.action === "string" ? message.action : "";
-  const actionId = typeof message.actionId === "string" && message.actionId ? message.actionId : crypto.randomUUID();
-  let resumeAfterMediaReady = false;
-
-  if (!["load", "play", "pause", "seek", "ratechange", "volumechange"].includes(action)) {
-    return {
-      accepted: false,
-      reason: "unknown-action",
-      actionId
-    };
-  }
-
-  if (
-    action === "play" &&
-    room.snapshot?.paused === true &&
-    room.snapshot.lastAction === "pause" &&
-    Number.isFinite(message.baseRevision) &&
-    message.baseRevision < room.revision &&
-    room.control.clientId !== context.clientId
-  ) {
-    return {
-      accepted: false,
-      reason: "stale-play-intent",
-      actionId
-    };
-  }
-
-  if (
-    action === "play" &&
-    message.mediaReadyRelease !== true &&
-    room.snapshot?.mediaUrl &&
-    !isRoomMediaReady(room, nowVal)
-  ) {
-    queuePendingRoomPlay(room, context, message, actionId, nowVal);
-    return {
-      accepted: true,
-      deferredUntilMediaReady: true,
-      actionId
-    };
-  }
-
-  if (action === "seek" && room.control.clientId === context.clientId) {
-    const seekInterval = nowVal - (room._lastSeekAt || 0);
-    if (seekInterval >= 0 && seekInterval < 300 && room.snapshot) {
-      const next = { ...room.snapshot };
-      if (typeof message.currentTime === "number" && Number.isFinite(message.currentTime)) {
-        next.currentTime = clampCurrentTime(message.currentTime);
-      }
-      if (typeof message.paused === "boolean") {
-        next.paused = message.paused;
-      }
-      room.revision += 1;
-      next.revision = room.revision;
-      next.updatedAt = nowVal;
-      next.lastAction = "seek";
-      next.lastActionId = actionId;
-      room.snapshot = next;
-      room.lastSeekClientId = context.clientId;
-      room.lastSeekAt = nowVal;
-      setPendingTimelineCommand(room, context, actionId, next, nowVal);
-      context.playbackStatus = {
-        clientId: context.clientId,
-        currentTime: next.currentTime,
-        paused: next.paused,
-        buffering: false,
-        applyingSeek: true,
-        mediaUrl: next.mediaUrl || "",
-        mediaReady: Boolean(
-          context.playbackStatus?.mediaReady && context.playbackStatus?.mediaUrl === next.mediaUrl
-        ),
-        receivedAt: nowVal
-      };
-      room._lastSeekAt = nowVal;
-      room.control.leaseUntil = nowVal + controlLeaseMs;
-      syncRoomPlaybackState(room);
-      broadcast(room, createRoomStatePayload(room), null);
-      schedulePersist();
-      return {
-        accepted: true,
-        actionId,
-        debounced: true
-      };
-    }
-  }
-  room._lastSeekAt = nowVal;
-
-  if (
-    room.control.clientId &&
-    room.control.clientId !== context.clientId &&
-    room.control.leaseUntil > nowVal &&
-    action !== "play" &&
-    action !== "pause"
-  ) {
-    return {
-      accepted: false,
-      reason: "control-lease-held",
-      actionId
-    };
-  }
-
-  const current = room.snapshot || { ...defaultPlaybackSnapshot };
-  const next = {
-    ...current
-  };
-
-  if (action === "load") {
-    resetRoomMediaLoadState(room);
-    resumeAfterMediaReady = message.paused === false;
-
-    if (typeof message.mediaUrl === "string" && message.mediaUrl.trim()) {
-      next.mediaUrl = message.mediaUrl.trim();
-    }
-
-    next.currentTime = clampCurrentTime(
-      typeof message.currentTime === "number" && Number.isFinite(message.currentTime) ? message.currentTime : 0
-    );
-
-    next.paused = true;
-  }
-
-  if (typeof message.currentTime === "number" && Number.isFinite(message.currentTime)) {
-    next.currentTime = clampCurrentTime(message.currentTime);
-  }
-
-  if (typeof message.playbackRate === "number" && Number.isFinite(message.playbackRate)) {
-    next.playbackRate = message.playbackRate;
-  }
-
-  if (typeof message.volume === "number" && Number.isFinite(message.volume)) {
-    next.volume = Math.min(1, Math.max(0, message.volume));
-  }
-
-  if (typeof message.muted === "boolean") {
-    next.muted = message.muted;
-  }
-
-  if (action === "seek" && typeof message.paused === "boolean") {
-    next.paused = message.paused;
-  }
-
-  if (action === "play") {
-    next.paused = false;
-  }
-
-  if (action === "pause") {
-    next.paused = true;
-    room.pendingPlayIntent = null;
-  }
-
-  if (action === "play" || action === "pause") {
-    room.pendingSeekCommand = null;
-    room.lastSeekClientId = null;
-    room.lastSeekAt = 0;
-  }
-
-  if (action === "seek") {
-    room.lastSeekClientId = context.clientId;
-    room.lastSeekAt = nowVal;
-  }
-
-  if (action === "seek") {
-    setPendingTimelineCommand(room, context, actionId, next, nowVal);
-  }
-
-  context.playbackStatus = {
-    clientId: context.clientId,
-    currentTime: next.currentTime,
-    paused: next.paused,
-    buffering: false,
-    applyingSeek: action === "seek",
-    mediaUrl: next.mediaUrl || "",
-    mediaReady: action === "load"
-      ? false
-      : Boolean(context.playbackStatus?.mediaReady && context.playbackStatus?.mediaUrl === next.mediaUrl),
-    receivedAt: nowVal
-  };
-
-  room.control = {
-    clientId: context.clientId,
-    name: context.name,
-    role: context.role,
-    leaseUntil: nowVal + controlLeaseMs,
-    actionId
-  };
-
-  room.revision += 1;
-  room.snapshot = {
-    ...next,
-    revision: room.revision,
-    updatedAt: nowVal,
-    lastAction: action,
-    lastActionId: actionId,
-    control: serializeControl(room)
-  };
-
-  if (action === "load" && resumeAfterMediaReady) {
-    queuePendingRoomPlay(room, context, {
-      currentTime: next.currentTime,
-      playbackRate: next.playbackRate,
-      volume: next.volume,
-      muted: next.muted
-    }, crypto.randomUUID(), nowVal);
-  }
-
-  syncRoomPlaybackState(room);
-  broadcastRoomSnapshot(room.code);
-  schedulePersist();
-
-  return {
-    accepted: true,
-    deferredUntilMediaReady: action === "load" && resumeAfterMediaReady,
-    actionId
-  };
-}
-
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
   if (url.pathname.startsWith("/api/")) {
@@ -1910,10 +1210,24 @@ const server = http.createServer(async (request, response) => {
 });
 
 const wss = new WebSocketServer({ noServer: true });
+const syncWss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (request, socket, head) => {
   const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
-  if (url.pathname !== "/ws") {
+  const syncRoomMatch = /^\/api\/rooms\/([^/]+)\/ws$/.exec(url.pathname);
+  if (syncRoomMatch) {
+    const roomId = normalizeRoomCode(syncRoomMatch[1]);
+    if (!roomId || roomId !== syncRoomMatch[1]) {
+      socket.destroy();
+      return;
+    }
+    syncWss.handleUpgrade(request, socket, head, (ws) => {
+      syncWss.emit("connection", ws, roomId);
+    });
+    return;
+  }
+
+  if (url.pathname !== "/ws" || url.search) {
     socket.destroy();
     return;
   }
@@ -1923,208 +1237,11 @@ server.on("upgrade", (request, socket, head) => {
   });
 });
 
+syncWss.on("connection", (socket, roomId) => {
+  roomSync.connect(roomId, socket);
+});
+
 wss.on("connection", (socket, request) => {
-  const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
-  const roomQuery = url.searchParams.get("room");
-  const roleQuery = url.searchParams.get("role");
-
-  const isSyncEngine = roomQuery != null || roleQuery != null;
-
-  if (isSyncEngine) {
-    const roomId = roomQuery || "lobby";
-    const role = roleQuery || "guest";
-    const name = url.searchParams.get("name") || "Guest";
-    const clientId = url.searchParams.get("clientId") || crypto.randomUUID();
-    const hasExtension = url.searchParams.get("hasExtension") === "true";
-    const room = getRoom(roomId);
-
-    socket.context = {
-      clientId,
-      name,
-      roomId,
-      role,
-      hasExtension
-    };
-
-    replaceClientConnection(room, socket);
-    refreshRoomSnapshotFromPlayback(room);
-
-    sendJson(socket, {
-      type: "connected",
-      roomId,
-      clientId,
-      revision: room.revision,
-      snapshot: serializeSnapshot(room),
-      control: serializeControl(room)
-    });
-
-    broadcastRoomSnapshot(room.roomId);
-
-    socket.on("message", (raw) => {
-      let message;
-
-      try {
-        message = JSON.parse(raw.toString("utf8"));
-      } catch {
-        return;
-      }
-
-      if (message.type === "join") {
-        socket.context = {
-          ...socket.context,
-          name: typeof message.name === "string" ? message.name : socket.context.name,
-          role: typeof message.role === "string" ? message.role : socket.context.role,
-          hasExtension: message.hasExtension === true
-        };
-
-        refreshRoomSnapshotFromPlayback(room);
-        broadcast(room, createPresencePayload(room));
-        broadcastRoomSnapshot(room.roomId);
-        return;
-      }
-
-      if (message.type === "request-sync") {
-        refreshRoomSnapshotFromPlayback(room);
-        sendJson(socket, createRoomStatePayload(room));
-        sendJson(socket, createPlaybackSyncPayload(room));
-        return;
-      }
-
-      if (message.type === "playback-status") {
-        const statusTimestamp = now();
-        const previousPlaybackState = getClientPlaybackState(room, socket.context);
-        const mediaUrl = typeof message.mediaUrl === "string" ? message.mediaUrl : "";
-        const mediaReady = message.mediaReady === true;
-        socket.context.playbackStatus = {
-          clientId: socket.context.clientId,
-          currentTime: clampCurrentTime(message.currentTime),
-          paused: Boolean(message.paused),
-          buffering: Boolean(message.buffering),
-          applyingSeek: Boolean(message.applyingSeek),
-          mediaUrl,
-          mediaReady,
-          receivedAt: statusTimestamp
-        };
-
-        retryPendingSeekForClient(room, socket, socket.context.playbackStatus, statusTimestamp);
-        releasePendingRoomPlay(room, statusTimestamp);
-        if (getClientPlaybackState(room, socket.context) !== previousPlaybackState) {
-          broadcast(room, createPresencePayload(room));
-        }
-        broadcastPlaybackSync(room);
-        return;
-      }
-
-      if (message.type === "player-intent") {
-        const result = applyPlayerIntent(room, socket.context, message, now());
-
-        if (!result.accepted) {
-          sendJson(socket, {
-            type: "player-intent-rejected",
-            roomId,
-            actionId: result.actionId,
-            action: message.action,
-            currentTime: message.currentTime,
-            paused: message.paused,
-            reason: result.reason,
-            revision: room.revision,
-            control: serializeControl(room),
-            snapshot: serializeSnapshot(room)
-          });
-
-          sendJson(socket, createRoomStatePayload(room));
-          return;
-        }
-
-        broadcast(
-          room,
-          createRoomStatePayload(room),
-          socket
-        );
-
-        sendJson(socket, {
-          type: "player-ack",
-          roomId,
-          actionId: result.actionId,
-          revision: room.revision,
-          control: serializeControl(room),
-          deferredUntilMediaReady: result.deferredUntilMediaReady === true
-        });
-
-        broadcast(room, createPresencePayload(room));
-        broadcastPlaybackSync(room);
-        return;
-      }
-
-      if (message.type === "media-request") {
-        const requestPayload = {
-          type: "media-request",
-          roomId,
-          clientId: message.clientId,
-          requestedSeasonId: message.requestedSeasonId || null,
-          requestedEpisodeId: message.requestedEpisodeId || null,
-          requestedQualityLabel: message.requestedQualityLabel || null,
-          requestedTranslatorId: message.requestedTranslatorId || null,
-          requestToken: message.requestToken || null
-        };
-        const resolverCandidates = Array.from(room.clients).filter((client) =>
-          client !== socket &&
-          client.readyState === 1 &&
-          client.context?.hasExtension === true
-        );
-        const resolverSocket = resolverCandidates.find((client) => client.context?.role === "host") || resolverCandidates[0];
-
-        if (resolverSocket) {
-          sendJson(resolverSocket, requestPayload);
-        } else {
-          broadcast(room, requestPayload, socket);
-        }
-
-        sendJson(socket, {
-          type: "player-ack",
-          roomId,
-          actionId: crypto.randomUUID(),
-          revision: room.revision,
-          control: serializeControl(room)
-        });
-        return;
-      }
-    });
-
-    socket.on("close", () => {
-      room.clients.delete(socket);
-      const replacementActive = Array.from(room.clients).some(
-        (client) => client.context?.clientId === socket.context.clientId
-      );
-
-      if (!replacementActive && room.control.clientId === socket.context.clientId) {
-        room.control = {
-          clientId: null,
-          name: "",
-          role: "",
-          leaseUntil: 0,
-          actionId: null
-        };
-      }
-
-      if (!replacementActive && room.lastSeekClientId === socket.context.clientId) {
-        room.lastSeekClientId = null;
-        room.lastSeekAt = 0;
-      }
-
-      refreshRoomSnapshotFromPlayback(room);
-      releasePendingRoomPlay(room);
-      broadcastRoomSnapshot(room.roomId);
-
-      if (deleteRoomIfOrphaned(roomId)) {
-        return;
-      }
-
-      broadcast(room, createPresencePayload(room));
-      broadcastPlaybackSync(room);
-    });
-
-  } else {
     connectedSockets.add(socket);
 
     socket.on("message", (raw) => {
@@ -2256,6 +1373,36 @@ wss.on("connection", (socket, request) => {
           broadcastRoomSnapshot(joinedRoomId);
         }
         broadcastRoomsList();
+        return;
+      }
+
+      if (message.type === "room:media-request") {
+        const roomId = normalizeRoomCode(message.roomId);
+        const room = rooms.get(roomId);
+        if (!room) return;
+
+        const candidates = [...getRoomMembers(roomId)]
+          .filter((candidate) => candidate !== socket && getSocketState(candidate).hasExtension === true)
+          .sort((left, right) => Number(getSocketState(right).role === "host") - Number(getSocketState(left).role === "host"));
+        const recipient = candidates[0];
+        if (!recipient) {
+          sendJson(socket, {
+            type: "room:error",
+            roomId,
+            message: "No participant can resolve this media request."
+          });
+          return;
+        }
+
+        sendJson(recipient, {
+          type: "media-request",
+          roomId,
+          requestedSeasonId: message.requestedSeasonId || null,
+          requestedEpisodeId: message.requestedEpisodeId || null,
+          requestedQualityLabel: message.requestedQualityLabel || null,
+          requestedTranslatorId: message.requestedTranslatorId || null,
+          requestedBy: getSocketState(socket).clientId
+        });
         return;
       }
 
@@ -2462,6 +1609,15 @@ wss.on("connection", (socket, request) => {
 
         const item = room.playlist.find((i) => i.id === message.playlistItemId);
         if (!item) return;
+        const syncResult = roomSync.setMedia(roomId, item.mediaUrl);
+        if ("error" in syncResult) {
+          sendJson(socket, {
+            type: "room:error",
+            roomId,
+            message: syncResult.error
+          });
+          return;
+        }
 
         room.currentMedia = {
           mediaUrl: item.mediaUrl,
@@ -2476,9 +1632,6 @@ wss.on("connection", (socket, request) => {
           time: 0,
           updatedAt: now()
         };
-
-        syncRoomSnapshotFromUI(room, item.mediaUrl, true, 0);
-        broadcast(room, createRoomStatePayload(room));
 
         markRoomUpdated(roomId);
         broadcastRoomSnapshot(roomId);
@@ -2520,7 +1673,6 @@ wss.on("connection", (socket, request) => {
           seriesContext: room.currentMedia.seriesContext,
           originId: message.originId || null
         });
-        broadcastSeriesContextToPlayback(room, message.originId || null);
         return;
       }
 
@@ -2529,6 +1681,16 @@ wss.on("connection", (socket, request) => {
         const room = rooms.get(roomId);
         if (!room) return;
         const nextSeriesContext = message.seriesContext || room.currentMedia?.seriesContext || null;
+        const mediaUrl = message.masterPlaylistUrl || message.mediaUrl;
+        const syncResult = roomSync.setMedia(roomId, mediaUrl);
+        if ("error" in syncResult) {
+          sendJson(socket, {
+            type: "room:error",
+            roomId,
+            message: syncResult.error
+          });
+          return;
+        }
 
         room.currentMedia = {
           mediaUrl: String(message.mediaUrl || ""),
@@ -2546,7 +1708,6 @@ wss.on("connection", (socket, request) => {
           updatedAt: now()
         };
 
-        syncRoomSnapshotFromUI(room, message.mediaUrl, true, 0);
         markRoomUpdated(roomId);
         broadcastToUiSockets(getRoomMembers(roomId), {
           type: "media:set",
@@ -2559,9 +1720,7 @@ wss.on("connection", (socket, request) => {
           seriesContext: room.currentMedia.seriesContext,
           originId: message.originId || null
         });
-        broadcastSeriesContextToPlayback(room, message.originId || null);
         broadcastRoomSnapshot(roomId);
-        broadcast(room, createRoomStatePayload(room));
         broadcastRoomsList();
         return;
       }
@@ -2571,17 +1730,8 @@ wss.on("connection", (socket, request) => {
       detachSocketFromRooms(socket);
       connectedSockets.delete(socket);
       socketState.delete(socket);
-      for (const roomCode of [...rooms.keys()]) {
-        const room = rooms.get(roomCode);
-        if (room && room.clients.size === 0 && (!room.participants || room.participants.length === 0)) {
-          rooms.delete(roomCode);
-          roomMembers.delete(roomCode);
-          playbackSeriesContextSignatures.delete(roomCode);
-        }
-      }
       broadcastRoomsList();
     });
-  }
 });
 
 server.on("error", (error) => {
@@ -2595,12 +1745,26 @@ server.on("error", (error) => {
 });
 
 async function startServer() {
+  await roomSync.restore();
   await loadRoomsFromDisk();
   await loadAuthFromDisk();
+  restoreSynchronizedMedia();
 
   server.listen(port, () => {
     console.log(`AnyTogether is running at http://localhost:${port}`);
   });
+}
+
+function restoreSynchronizedMedia() {
+  for (const room of rooms.values()) {
+    if (roomSync.getState(room.code)) {
+      continue;
+    }
+    const mediaUrl = room.currentMedia?.masterPlaylistUrl || room.currentMedia?.mediaUrl;
+    if (mediaUrl) {
+      roomSync.setMedia(room.code, mediaUrl);
+    }
+  }
 }
 
 void startServer();

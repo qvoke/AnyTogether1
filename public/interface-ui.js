@@ -1313,6 +1313,10 @@ function buildMediaLoadSignature(mediaUrl, masterPlaylistUrl, seriesContext) {
   ].join("::");
 }
 
+function normalizePlayableMediaUrl(value) {
+  return String(value || "").trim().replace(/,\[$/, "");
+}
+
 function getPendingEpisodeSelection(roomState) {
   const pending = roomState?.ui?._pendingEpisodeTarget || null;
   if (!pending) return null;
@@ -1548,6 +1552,19 @@ function ensureLocalParticipant(roomId) {
 function getActiveSeriesContext() {
   return getActiveRoomState()?.currentMedia?.seriesContext || null;
 }
+
+window.__getInterfaceMediaState = function() {
+  const roomState = getActiveRoomState();
+  const media = roomState?.currentMedia || null;
+  const seriesContext = media?.seriesContext || null;
+  return {
+    mediaUrl: media?.mediaUrl || "",
+    masterPlaylistUrl: media?.masterPlaylistUrl || "",
+    seasonId: seriesContext?.currentSeasonId ?? null,
+    episodeId: seriesContext?.currentEpisodeId ?? null,
+    title: seriesContext?.title || media?.title || ""
+  };
+};
 
 function getActiveUiState() {
   return getActiveRoomState()?.ui || createDefaultUi(getActiveSeriesContext());
@@ -4012,6 +4029,12 @@ function updateRoomFromMediaPayload(roomId, payload, shouldBroadcast) {
   const normalized = normalizeRoomCode(roomId);
   if (!normalized) return;
 
+  payload = {
+    ...payload,
+    mediaUrl: normalizePlayableMediaUrl(payload.mediaUrl),
+    masterPlaylistUrl: normalizePlayableMediaUrl(payload.masterPlaylistUrl)
+  };
+
   const roomState = ensureRoomState(normalized);
   const previousMedia = roomState.currentMedia || null;
   const previousSeriesContext = previousMedia?.seriesContext || null;
@@ -4030,7 +4053,7 @@ function updateRoomFromMediaPayload(roomId, payload, shouldBroadcast) {
   );
   roomState.currentMedia = {
     mediaUrl: payload.mediaUrl,
-    masterPlaylistUrl: payload.masterPlaylistUrl || previousMedia?.masterPlaylistUrl || null,
+    masterPlaylistUrl: payload.masterPlaylistUrl || null,
     pageUrl: nextPageUrl,
     sourcePageUrl: nextSourcePageUrl,
     title: payload.title || nextSeriesContext?.title || previousMedia?.title || null,
@@ -4088,7 +4111,7 @@ function updateRoomFromMediaPayload(roomId, payload, shouldBroadcast) {
       type: "media:set",
       roomId: normalized,
       mediaUrl: payload.mediaUrl,
-      masterPlaylistUrl: payload.masterPlaylistUrl || previousMedia?.masterPlaylistUrl || null,
+      masterPlaylistUrl: payload.masterPlaylistUrl || null,
       pageUrl: payload.pageUrl || previousMedia?.pageUrl || null,
       sourcePageUrl: payload.sourcePageUrl || previousMedia?.sourcePageUrl || null,
       title: payload.title || nextSeriesContext?.title || null,
@@ -4204,6 +4227,23 @@ function requestEpisodeResolution(targetEpisode, overrides = {}) {
   );
 
   setSearchHint(`Loading episode: S${targetEpisode.seasonId} E${targetEpisode.episodeId}`);
+}
+
+function requestCurrentMediaRecovery() {
+  const roomState = getActiveRoomState();
+  const seriesContext = roomState?.currentMedia?.seriesContext;
+  const seasonId = Number(seriesContext?.currentSeasonId);
+  const episodeId = Number(seriesContext?.currentEpisodeId);
+  if (!roomState || !Number.isFinite(seasonId) || !Number.isFinite(episodeId)) {
+    return false;
+  }
+
+  requestEpisodeResolution({
+    seasonId,
+    episodeId,
+    title: seriesContext?.title || roomState.currentMedia?.title || null
+  });
+  return true;
 }
 
 function sendSearchToExtension(query) {
@@ -4515,6 +4555,11 @@ function connectWs() {
       return;
     }
 
+    if (msg.type === "media-request") {
+      window.dispatchEvent(new CustomEvent("anytogether:media-request", { detail: msg }));
+      return;
+    }
+
     if (msg.type === "room:snapshot") {
       const roomId = normalizeRoomCode(msg.roomId);
       if (!roomId) return;
@@ -4575,6 +4620,13 @@ function connectWs() {
           newRoomState.ui.codeHidden = prevUi.codeHidden;
         }
         sanitizeRoomUi(newRoomState);
+      }
+      if (state.activeRoomId === roomId) {
+        loadedMediaKey = "";
+        lastSyncMediaKey = "";
+        syncMediaBlockUntil = 0;
+        refreshActiveRoom();
+        syncActiveRoomMedia(true);
       }
       return;
     }
@@ -5177,7 +5229,7 @@ async function start() {
 
       const roomState = ensureRoomState(effectiveRoomId);
 
-      const mediaUrl = payload.mediaUrl || "";
+      const mediaUrl = normalizePlayableMediaUrl(payload.mediaUrl);
       const hasSeriesContext = hasNavigableSeriesContext(payload.seriesContext);
       const currentSeriesContext = roomState.currentMedia?.seriesContext || null;
       const contextWasExpanded = hasSeriesContextUpgrade(payload.seriesContext, currentSeriesContext);
@@ -5411,6 +5463,26 @@ async function start() {
         qualityLabel: roomState.ui.qualityLabel
       });
     }
+  });
+
+  window.addEventListener("anytogether:outbound-media-request", (event) => {
+    const roomState = getActiveRoomState();
+    if (!roomState) return;
+
+    const detail = event.detail || {};
+    sendWs({
+      type: "room:media-request",
+      roomId: roomState.code,
+      requestedSeasonId: detail.requestedSeasonId || null,
+      requestedEpisodeId: detail.requestedEpisodeId || null,
+      requestedQualityLabel: detail.requestedQualityLabel || null,
+      requestedTranslatorId: detail.requestedTranslatorId || null
+    });
+  });
+
+  window.addEventListener("anytogether:media-recovery-request", () => {
+    if (!hasLocalExtension()) return;
+    requestCurrentMediaRecovery();
   });
 }
 
