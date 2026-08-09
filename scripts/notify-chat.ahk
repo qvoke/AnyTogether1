@@ -2,7 +2,9 @@
 
 runId := A_Args.Length >= 1 ? A_Args[1] : "unknown"
 resultPath := A_Args.Length >= 2 ? A_Args[2] : ""
-message := "Тест готов. RunId: " runId
+exitCode := A_Args.Length >= 3 ? A_Args[3] : "0"
+status := exitCode = "0" ? "passed" : "failed"
+message := "E2E test " status ". RunId: " runId
 if (resultPath != "") {
   message .= " | Результаты: " resultPath
 }

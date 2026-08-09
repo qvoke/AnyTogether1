@@ -106,6 +106,10 @@ the local server:
 Remove-Item Env:E2E_BASE_URL -ErrorAction SilentlyContinue
 ```
 
+After either E2E command finishes, it invokes `scripts/notify-chat.ahk` with
+the run identifier, result status, and report path. Set `AUTOHOTKEY_EXE` when
+AutoHotkey is not available as `AutoHotkey64.exe` on `PATH`.
+
 The generated sync log records `progressDeltaSec` for both videos and marks
 each checkpoint with `hangDetected` when a playing video fails to advance
 during the settle window.
