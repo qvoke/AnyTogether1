@@ -55,7 +55,7 @@ async function waitForMedia(page, mediaUrl) {
     const state = await pipelineState(page);
     return state?.version === 1 && state.mediaUrl === mediaUrl;
   }, { timeout: 30_000 }).toBe(true);
-  await expect.poll(() => page.locator("#player").evaluate((video) => video.readyState >= 1), {
+  await expect.poll(() => page.locator("#player").evaluate((video) => video.readyState >= 2), {
     timeout: 30_000
   }).toBe(true);
 }
@@ -69,23 +69,53 @@ async function playbackSamples(pages) {
   }))));
 }
 
+async function waitForPlayableMedia(pageA, pageB) {
+  await expect.poll(async () => {
+    const samples = await playbackSamples([pageA, pageB]);
+    return samples.every((sample) => sample.readyState >= 2);
+  }, { intervals: [100, 250, 500, 1_000], timeout: 30_000 }).toBe(true);
+}
+
 async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncLog = null, persistSyncLog = null) {
   let finalSamples = [];
   const synchronizationStartedAt = Date.now();
-  await expect.poll(async () => {
-    const samples = await playbackSamples([pageA, pageB]);
-    finalSamples = samples;
-    if (samples.some((sample) => sample.readyState < 1 || sample.paused)) {
-      return false;
+  try {
+    await expect.poll(async () => {
+      const samples = await playbackSamples([pageA, pageB]);
+      finalSamples = samples;
+      if (samples.some((sample) => sample.readyState < 2 || sample.paused)) {
+        return false;
+      }
+      if (Math.abs(samples[0].currentTime - samples[1].currentTime) >= 0.75) {
+        return false;
+      }
+      if (expectedPosition === undefined) {
+        return samples.every((sample) => sample.currentTime > 0.25);
+      }
+      const expectedPositionAtSample = expectedPosition + (Date.now() - synchronizationStartedAt) / 1_000;
+      return samples.every((sample) => Math.abs(sample.currentTime - expectedPositionAtSample) < 1.5);
+    }, { intervals: [100, 250, 500, 1_000], timeout: 30_000 }).toBe(true);
+  } catch (error) {
+    if (syncLog) {
+      syncLog.push({
+        targetPosition: expectedPosition ?? null,
+        convergenceWaitMs: Date.now() - synchronizationStartedAt,
+        settledAfterMs: 0,
+        totalWaitMs: Date.now() - synchronizationStartedAt,
+        samples: finalSamples.map(({ currentTime, readyState }) => ({ currentTime, readyState })),
+        deltaMs: finalSamples.length === 2
+          ? Math.round(Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000)
+          : null,
+        progressDeltaSec: [],
+        hangDetected: false,
+        convergenceTimedOut: true
+      });
+      if (persistSyncLog) {
+        await persistSyncLog();
+      }
     }
-    if (Math.abs(samples[0].currentTime - samples[1].currentTime) >= 0.75) {
-      return false;
-    }
-    if (expectedPosition === undefined) {
-      return samples.every((sample) => sample.currentTime > 0.25);
-    }
-    return samples.every((sample) => Math.abs(sample.currentTime - expectedPosition) < 1.5);
-  }, { intervals: [100, 250, 500, 1_000], timeout: 30_000 }).toBe(true);
+    throw error;
+  }
 
   const settleMs = Math.max(0, Number(config.playbackSettleMs) || 0);
   const settleStartSamples = await playbackSamples([pageA, pageB]);
@@ -170,6 +200,7 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   const random = createRandom(config.randomSeed);
   const seekCount = Math.max(0, Math.floor(Number(config.seekCount) || config.seekPositionsSec?.length || 0));
   for (let index = 0; index < seekCount; index += 1) {
+    await waitForPlayableMedia(first.page, second.page);
     const sourcePage = index % 2 === 0 ? first.page : second.page;
     const mediaSample = await sourcePage.locator("#player").evaluate((video) => ({
       currentTime: video.currentTime,
@@ -186,10 +217,10 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
     }
 
     const versionBeforeSeek = (await pipelineState(first.page)).version;
-    await sourcePage.locator("#player").evaluate((video, position) => {
-      video.currentTime = position;
-      video.dispatchEvent(new Event("seeked"));
-    }, targetPosition);
+    const seekSent = await sourcePage.evaluate((position) => (
+      window.anyTogetherSyncBridge?.seek(position) === true
+    ), targetPosition);
+    expect(seekSent).toBe(true);
     await expect.poll(async () => (await pipelineState(first.page))?.version).toBeGreaterThan(versionBeforeSeek);
     const versionAfterSeek = (await pipelineState(first.page)).version;
     await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionAfterSeek);

@@ -25,6 +25,7 @@ const state = {
   reconnectTimer: null,
   remotePlayUntil: 0,
   remoteSeek: null,
+  localSeekActive: false,
   resetRateTimer: null,
   roomId: null,
   roomState: null,
@@ -270,6 +271,9 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
   if (!player || !roomState?.media || player.readyState < HTMLMediaElement.HAVE_METADATA) {
     return;
   }
+  if (state.localSeekActive && reason !== "seeked") {
+    return;
+  }
 
   const expectedPosition = clampPosition(getPositionAt(roomState, serverTimeMs), player.duration);
   const error = expectedPosition - player.currentTime;
@@ -348,6 +352,7 @@ function unloadSource() {
   state.hls?.destroy();
   state.hls = null;
   state.sourceId = null;
+  state.localSeekActive = false;
   if (!player) {
     return;
   }
@@ -449,7 +454,13 @@ function bindPlayerEvents() {
 
   player.addEventListener("loadedmetadata", () => synchronizePlayer("metadata"));
   player.addEventListener("canplay", () => synchronizePlayer("canplay"));
+  player.addEventListener("seeking", () => {
+    if (shouldPublishLocalEvent() && !state.remoteSeek) {
+      state.localSeekActive = true;
+    }
+  });
   player.addEventListener("seeked", () => {
+    state.localSeekActive = false;
     const remoteSeek = state.remoteSeek;
     const completedRemoteSeek = Boolean(
       remoteSeek &&
@@ -504,6 +515,13 @@ window.anyTogetherSyncBridge = {
   },
   loadMedia(url, forceReload = false) {
     return loadInterfaceMedia(url, forceReload);
+  },
+  seek(positionSec) {
+    const position = Number(positionSec);
+    if (!Number.isFinite(position) || position < 0) {
+      return false;
+    }
+    return sendAction({ positionSec: position, type: "seek" });
   }
 };
 
