@@ -29,7 +29,7 @@ const state = {
   roomId: null,
   roomState: null,
   sourceId: null,
-  suppressLocalEventsUntil: 0
+  isApplyingRemoteEvent: false
 };
 
 function getClientId() {
@@ -276,26 +276,23 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
   const absoluteError = Math.abs(error);
   state.lastSyncErrorMs = Math.round(absoluteError * 1_000);
 
-  withRemoteControl(() => {
-    if (roomState.playback.paused) {
-      if (!player.paused) {
-        player.pause();
-      }
-      if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
-        setRemotePosition(player, expectedPosition);
-      }
-      player.playbackRate = 1;
-      return;
+  if (roomState.playback.paused) {
+    if (!player.paused) {
+      withRemoteControl(() => player.pause());
     }
-
+    if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
+      withRemoteControl(() => setRemotePosition(player, expectedPosition));
+    }
+    player.playbackRate = 1;
+  } else {
     if (absoluteError > HARD_SYNC_THRESHOLD_SEC || player.paused) {
-      setRemotePosition(player, expectedPosition);
+      withRemoteControl(() => setRemotePosition(player, expectedPosition));
     } else if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
       player.playbackRate = error > 0 ? 1.04 : 0.96;
       resetPlaybackRate(player);
     }
     requestAuthoritativePlayback(player);
-  });
+  }
 
   if (reason === "room-update") {
     logSyncEvent("Room timeline applied", { version: roomState.version, errorMs: state.lastSyncErrorMs });
@@ -326,8 +323,12 @@ function requestAuthoritativePlayback(player) {
 }
 
 function withRemoteControl(callback) {
-  state.suppressLocalEventsUntil = performance.now() + 600;
-  callback();
+  state.isApplyingRemoteEvent = true;
+  try {
+    callback();
+  } finally {
+    state.isApplyingRemoteEvent = false;
+  }
 }
 
 function setRemotePosition(player, positionSec) {
@@ -339,7 +340,7 @@ function setRemotePosition(player, positionSec) {
 }
 
 function shouldPublishLocalEvent() {
-  return performance.now() >= state.suppressLocalEventsUntil && Boolean(state.roomState?.media);
+  return !state.isApplyingRemoteEvent && Boolean(state.roomState?.media);
 }
 
 function unloadSource() {
@@ -517,9 +518,13 @@ window.__getPlaybackSyncInfo = (participantClientId = state.clientId) => {
   return { active: true, buffering: elements.player?.readyState < HTMLMediaElement.HAVE_FUTURE_DATA, offsetMs: state.lastSyncErrorMs };
 };
 window.__getPlaybackPipelineState = () => ({
+  connected: isSocketOpen(),
   hlsActive: Boolean(state.hls),
   mediaUrl: state.roomState?.media?.url || "",
-  ready: Boolean(elements.player && elements.player.readyState >= HTMLMediaElement.HAVE_METADATA)
+  paused: state.roomState?.playback?.paused ?? true,
+  ready: Boolean(elements.player && elements.player.readyState >= HTMLMediaElement.HAVE_METADATA),
+  roomId: state.roomId,
+  version: state.roomState?.version ?? null
 });
 
 bindPlayerEvents();

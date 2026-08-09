@@ -65,6 +65,32 @@ Run the synchronization checks with:
 npm run test:sync
 ```
 
+## Browser end-to-end checks
+
+Install the local Chromium binary once:
+
+```bash
+npm run test:e2e:install
+```
+
+Run the room connection smoke test:
+
+```bash
+npm run test:e2e
+```
+
+Set a public CORS-enabled MP4 or HLS VOD source to also verify media loading,
+play, seek, and pause across two isolated browser contexts:
+
+```powershell
+$env:E2E_MEDIA_URL = "https://cdn.example.com/video.mp4"
+npm run test:e2e:watch
+```
+
+`test:e2e:watch` opens the browser so the synchronization can be observed.
+Set `E2E_BASE_URL` to run the same suite against a deployed instance instead
+of starting a local server.
+
 ## Site and extension bridge
 
 The page sends a search request with `window.postMessage`:

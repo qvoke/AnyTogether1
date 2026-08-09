@@ -9,9 +9,14 @@ import { RoomSyncService } from "./lib/room-sync.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, "public");
-const port = 3000;
+const requestedPort = Number(process.env.PORT || 3000);
+const port = Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort <= 65_535
+  ? requestedPort
+  : 3000;
 
-const dataDir = path.join(__dirname, "data");
+const dataDir = process.env.ANYTOGETHER_DATA_DIR
+  ? path.resolve(process.env.ANYTOGETHER_DATA_DIR)
+  : path.join(__dirname, "data");
 const roomStorePath = path.join(dataDir, "rooms.json");
 const authStorePath = path.join(dataDir, "auth.json");
 

@@ -1,0 +1,6 @@
+{
+  "holdMs": 0,
+  "playbackSettleMs": 1500,
+  "seekPositionsSec": [5, 30, 120],
+  "mediaUrl": ""
+}
