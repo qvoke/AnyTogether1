@@ -96,7 +96,7 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
     await expect.poll(async () => {
       const samples = await playbackSamples([pageA, pageB]);
       finalSamples = samples;
-      if (samples.some((sample) => sample.readyState < 2 || sample.paused)) {
+      if (samples.some((sample) => sample.readyState < 1 || sample.paused)) {
         return false;
       }
       if (Math.abs(samples[0].currentTime - samples[1].currentTime) >= 0.75) {

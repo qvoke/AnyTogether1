@@ -9,8 +9,7 @@ if (resultPath != "") {
   message .= " | Результаты: " resultPath
 }
 
-Send("#1")
-Sleep(700)
+
 Click(1700, 900)
 Sleep(250)
 SendText(message)

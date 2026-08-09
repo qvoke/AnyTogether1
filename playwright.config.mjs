@@ -11,7 +11,8 @@ export default defineConfig({
   outputDir: ".notes/build-codex/e2e-results",
   reporter: [
     ["list"],
-    ["json", { outputFile: ".notes/build-codex/e2e-report.json" }]
+    ["json", { outputFile: ".notes/build-codex/e2e-report.json" }],
+    ["./scripts/e2e-notify-reporter.mjs"]
   ],
   timeout: 45_000,
   use: {
