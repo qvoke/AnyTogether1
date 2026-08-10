@@ -125,33 +125,20 @@ function createControls() {
   bindEvents();
 }
 
-// Control events
 function bindEvents() {
   if (!video) return;
 
-  // Play/Pause
   UI.playBtn.addEventListener('click', () => {
-    if (video.paused) {
-      window.anyTogetherSyncBridge?.play();
-      showCenterIcon('play');
-    } else {
-      window.anyTogetherSyncBridge?.pause();
-      showCenterIcon('pause');
-    }
+    window.anyTogetherSyncBridge?.toggle();
+    showCenterIcon(video.paused ? 'play' : 'pause');
   });
 
   // Clicking the video follows the same authoritative command path as the button.
   video.addEventListener('click', () => {
-    if (video.paused) {
-      window.anyTogetherSyncBridge?.play();
-      showCenterIcon('play');
-    } else {
-      window.anyTogetherSyncBridge?.pause();
-      showCenterIcon('pause');
-    }
+    window.anyTogetherSyncBridge?.toggle();
+    showCenterIcon(video.paused ? 'play' : 'pause');
   });
 
-  // Progress bar drag
   UI.progressBar.addEventListener('mousedown', (e) => {
     _isDragging = true;
     previewSeekFromMouse(e);
@@ -176,7 +163,6 @@ function bindEvents() {
     _pendingSeekPosition = video.duration ? pct * video.duration : null;
   }
 
-  // Volume
   UI.volumeBar.addEventListener('mousedown', (e) => {
     _isVolumeDragging = true;
     volFromMouse(e);
@@ -197,11 +183,10 @@ function bindEvents() {
   });
 
   UI.skipBackBtn.addEventListener('click', () => {
-    window.anyTogetherSyncBridge?.seek(Math.max(0, (video.currentTime || 0) - 5));
+    window.anyTogetherSyncBridge?.seekBy(-5);
   });
   UI.skipForwardBtn.addEventListener('click', () => {
-    const duration = Number.isFinite(video.duration) ? video.duration : Infinity;
-    window.anyTogetherSyncBridge?.seek(Math.min(duration, (video.currentTime || 0) + 5));
+    window.anyTogetherSyncBridge?.seekBy(5);
   });
 
   document.addEventListener('keydown', (event) => {
@@ -210,22 +195,16 @@ function bindEvents() {
     }
     if (event.code === 'Space') {
       event.preventDefault();
-      if (video.paused) {
-        window.anyTogetherSyncBridge?.play();
-      } else {
-        window.anyTogetherSyncBridge?.pause();
-      }
+      window.anyTogetherSyncBridge?.toggle();
     } else if (event.code === 'ArrowLeft') {
       event.preventDefault();
-      window.anyTogetherSyncBridge?.seek(Math.max(0, (video.currentTime || 0) - 5));
+      window.anyTogetherSyncBridge?.seekBy(-5);
     } else if (event.code === 'ArrowRight') {
       event.preventDefault();
-      const duration = Number.isFinite(video.duration) ? video.duration : Infinity;
-      window.anyTogetherSyncBridge?.seek(Math.min(duration, (video.currentTime || 0) + 5));
+      window.anyTogetherSyncBridge?.seekBy(5);
     }
   });
 
-  // Settings
   UI.settingsBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     if (window.toggleSettingsPanel) {
@@ -233,7 +212,6 @@ function bindEvents() {
     }
   });
 
-  // Fullscreen
   UI.fullscreenBtn.addEventListener('click', () => {
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => {});

@@ -1,10 +1,12 @@
+import { getRelativeSeekPosition } from "./playback-policy.js";
+
 const elements = {
   activeRoom: document.getElementById("activeRoom"),
   connectionState: document.getElementById("connectionState"),
   currentMediaLabel: document.getElementById("currentMediaLabel"),
   mediaUrl: document.getElementById("mediaUrl"),
   playbackState: document.getElementById("playbackState"),
-  player: document.getElementById("player") || document.getElementById("video"),
+  player: document.querySelector("[data-current-room-shell] #player") || document.getElementById("video"),
   revisionLabel: document.getElementById("revisionLabel")
 };
 
@@ -27,17 +29,14 @@ const state = {
   lastHlsLoadVersion: null,
   lastSyncErrorMs: 0,
   playbackBlocked: false,
-  mediaBuffering: false,
   reconnectTimer: null,
   remotePlayUntil: 0,
-  remoteSeek: null,
   pendingSeek: null,
   resetRateTimer: null,
   roomId: null,
   roomState: null,
   sourceId: null,
-  playbackEvents: [],
-  isApplyingRemoteEvent: false
+  playbackEvents: []
 };
 
 function getClientId() {
@@ -268,7 +267,7 @@ function applySnapshot(nextState, serverTimeMs) {
   });
   state.roomState = nextState;
   if (state.pendingSeek && nextState.version > state.pendingSeek.baseVersion) {
-    const confirmedPosition = getPositionAt(nextState, serverTimeMs);
+    const confirmedPosition = nextState.playback.anchorPositionSec;
     if (Math.abs(confirmedPosition - state.pendingSeek.positionSec) < 0.5) {
       state.pendingSeek = null;
     }
@@ -284,7 +283,7 @@ function applySnapshot(nextState, serverTimeMs) {
     loadSource(nextState.media);
   }
 
-  window.setTimeout(() => synchronizePlayer("room-update", serverTimeMs), 0);
+  window.setTimeout(() => synchronizePlayer("room-update"), 0);
 }
 
 function isRoomState(value) {
@@ -313,6 +312,7 @@ function sendAction(pendingAction) {
     mediaId: roomState.media?.id ?? null
   };
   state.connection.send(JSON.stringify({ action, type: "action" }));
+  storeDiagnostic({ type: "action-sent", actionType: action.type, knownVersion: action.knownVersion });
   return true;
 }
 
@@ -330,16 +330,16 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
 
   if (roomState.playback.paused) {
     if (!player.paused) {
-      withRemoteControl(() => player.pause());
+      player.pause();
     }
     if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
-      withRemoteControl(() => setRemotePosition(player, expectedPosition));
+      setRemotePosition(player, expectedPosition);
       startHlsLoadForState(roomState, expectedPosition);
     }
     player.playbackRate = 1;
   } else {
     if (absoluteError > HARD_SYNC_THRESHOLD_SEC || player.paused) {
-      withRemoteControl(() => setRemotePosition(player, expectedPosition));
+      setRemotePosition(player, expectedPosition);
       startHlsLoadForState(roomState, expectedPosition);
     } else if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
       player.playbackRate = error > 0 ? 1.04 : 0.96;
@@ -384,20 +384,7 @@ function requestAuthoritativePlayback(player) {
   });
 }
 
-function withRemoteControl(callback) {
-  state.isApplyingRemoteEvent = true;
-  try {
-    callback();
-  } finally {
-    state.isApplyingRemoteEvent = false;
-  }
-}
-
 function setRemotePosition(player, positionSec) {
-  state.remoteSeek = {
-    expiresAt: performance.now() + 10_000,
-    positionSec
-  };
   player.currentTime = positionSec;
 }
 
@@ -407,16 +394,13 @@ function unloadSource() {
   state.hls = null;
   state.lastHlsRecoveryAt = 0;
   state.lastHlsLoadVersion = null;
-  state.mediaBuffering = false;
   state.sourceId = null;
   if (!player) {
     return;
   }
-  withRemoteControl(() => {
-    player.pause();
-    player.removeAttribute("src");
-    player.load();
-  });
+  player.pause();
+  player.removeAttribute("src");
+  player.load();
 }
 
 function loadSource(media) {
@@ -470,6 +454,16 @@ function loadSource(media) {
 }
 
 function handleHlsError(hls, data) {
+  storeDiagnostic({
+    type: "hls-error",
+    details: data.details,
+    fatal: data.fatal,
+    errorType: data.type,
+    response: data.response
+      ? { code: data.response.code, text: data.response.text, url: data.response.url }
+      : null,
+    url: data.url || null
+  });
   if (data.details === "bufferSeekOverHole" || data.details === "bufferNudgeOnStall") {
     hls.startLoad();
     logSyncEvent("HLS is correcting a buffer gap after the seek.");
@@ -528,13 +522,11 @@ function bindPlayerEvents() {
   player.addEventListener("loadedmetadata", () => synchronizePlayer("metadata"));
   player.addEventListener("canplay", () => synchronizePlayer("canplay"));
   player.addEventListener("waiting", () => {
-    state.mediaBuffering = true;
     state.remotePlayUntil = performance.now() + 60_000;
     recordPlaybackEvent("waiting", player);
     logSyncEvent("Buffering media at the shared position.");
   });
   player.addEventListener("playing", () => {
-    state.mediaBuffering = false;
     state.remotePlayUntil = 0;
     recordPlaybackEvent("playing", player);
     logSyncEvent("Playing in sync.");
@@ -544,15 +536,6 @@ function bindPlayerEvents() {
   });
   player.addEventListener("seeked", () => {
     recordPlaybackEvent("seeked", player);
-    const remoteSeek = state.remoteSeek;
-    const completedRemoteSeek = Boolean(
-      remoteSeek &&
-      performance.now() <= remoteSeek.expiresAt &&
-      Math.abs(player.currentTime - remoteSeek.positionSec) < 0.5
-    );
-    if (completedRemoteSeek || (remoteSeek && performance.now() > remoteSeek.expiresAt)) {
-      state.remoteSeek = null;
-    }
     synchronizePlayer("seeked");
   });
   player.addEventListener("play", () => {
@@ -603,6 +586,33 @@ window.anyTogetherSyncBridge = {
   },
   pause() {
     return sendAction({ type: "pause" });
+  },
+  toggle() {
+    if (!state.roomState?.media) {
+      return false;
+    }
+    state.playbackBlocked = false;
+    return sendAction({ type: state.roomState.playback.paused ? "play" : "pause" });
+  },
+  seekBy(deltaSec) {
+    if (!state.roomState?.media) {
+      return false;
+    }
+    const delta = Number(deltaSec);
+    if (!Number.isFinite(delta)) {
+      return false;
+    }
+    const position = getRelativeSeekPosition(
+      state.roomState,
+      estimateServerNow(),
+      delta,
+      elements.player?.duration
+    );
+    state.pendingSeek = {
+      baseVersion: state.roomState.version,
+      positionSec: position
+    };
+    return sendAction({ positionSec: position, type: "seek" });
   },
   seek(positionSec) {
     const position = Number(positionSec);

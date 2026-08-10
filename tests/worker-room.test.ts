@@ -25,8 +25,15 @@ class MemoryStorage {
     return this.values.get(key) as T | undefined;
   }
 
-  async put<T>(key: string, value: T) {
-    this.values.set(key, structuredClone(value));
+  async put<T>(keyOrEntries: string | Record<string, T>, value?: T) {
+    if (typeof keyOrEntries === "string") {
+      this.values.set(keyOrEntries, structuredClone(value));
+      return;
+    }
+
+    for (const [key, item] of Object.entries(keyOrEntries)) {
+      this.values.set(key, structuredClone(item));
+    }
   }
 
   async setAlarm(value: number | Date) {

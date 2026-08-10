@@ -294,16 +294,19 @@ export class RoomDurableObject implements DurableObject {
     if (this.room) {
       this.room.lastUpdatedAt = serverTimeMs;
     }
-    await Promise.all([
-      this.state.storage.put(SYNC_STATE_KEY, this.syncState),
-      this.state.storage.put(ACTION_IDS_KEY, this.actionIds),
-      this.state.storage.put(SYNC_EXPIRY_KEY, this.syncExpiresAtMs),
-      this.room ? this.state.storage.put(ROOM_KEY, this.room) : Promise.resolve(),
-    ]);
-    await this.scheduleNextAlarm();
+    const syncStorage: Record<string, unknown> = {
+      [SYNC_STATE_KEY]: this.syncState,
+      [ACTION_IDS_KEY]: this.actionIds,
+      [SYNC_EXPIRY_KEY]: this.syncExpiresAtMs,
+    };
+    if (this.room) {
+      syncStorage[ROOM_KEY] = this.room;
+    }
+    await this.state.storage.put(syncStorage, { allowUnconfirmed: true });
+    await this.scheduleNextAlarm(true);
     this.broadcastSyncSnapshot();
-    this.broadcastUiSnapshot();
     if (action.type === "setMedia") {
+      this.broadcastUiSnapshot();
       this.queueSummaryPersistence();
     }
   }
@@ -954,15 +957,16 @@ export class RoomDurableObject implements DurableObject {
     }));
   }
 
-  private async scheduleNextAlarm(): Promise<void> {
+  private async scheduleNextAlarm(allowUnconfirmed = false): Promise<void> {
+    const options = allowUnconfirmed ? { allowUnconfirmed: true } : undefined;
     const deadlines = Object.values(this.offlineDeadlines);
     if (this.syncExpiresAtMs !== null) {
       deadlines.push(this.syncExpiresAtMs);
     }
     if (deadlines.length > 0) {
-      await this.state.storage.setAlarm(Math.min(...deadlines));
+      await this.state.storage.setAlarm(Math.min(...deadlines), options);
     } else {
-      await this.state.storage.deleteAlarm();
+      await this.state.storage.deleteAlarm(options);
     }
   }
 
