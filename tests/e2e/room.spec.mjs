@@ -234,15 +234,31 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
 
     const versionBeforeSeek = (await pipelineState(first.page)).version;
     const seekStartedAt = Date.now();
-    const seekSent = await sourcePage.evaluate((position) => (
-      window.anyTogetherSyncBridge?.seek(position) === true
-    ), targetPosition);
-    expect(seekSent).toBe(true);
+    if (index === 0) {
+      const progressBar = sourcePage.locator(".progress-bar");
+      const progressBox = await progressBar.boundingBox();
+      expect(progressBox).not.toBeNull();
+      const startX = progressBox.x + progressBox.width * 0.1;
+      const targetX = progressBox.x + progressBox.width * Math.min(1, targetPosition / duration);
+      const centerY = progressBox.y + progressBox.height / 2;
+      await sourcePage.mouse.move(startX, centerY);
+      await sourcePage.mouse.down();
+      await sourcePage.mouse.move(targetX, centerY, { steps: 12 });
+      await sourcePage.mouse.up();
+    } else {
+      const seekSent = await sourcePage.evaluate((position) => (
+        window.anyTogetherSyncBridge?.seek(position) === true
+      ), targetPosition);
+      expect(seekSent).toBe(true);
+    }
     await expect.poll(
       async () => (await pipelineState(first.page))?.version,
       { timeout: 15_000 }
     ).toBeGreaterThan(versionBeforeSeek);
     const versionAfterSeek = (await pipelineState(first.page)).version;
+    if (index === 0) {
+      expect(versionAfterSeek).toBe(versionBeforeSeek + 1);
+    }
     await expect.poll(
       async () => (await pipelineState(second.page))?.version,
       { timeout: 15_000 }

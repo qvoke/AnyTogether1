@@ -51,14 +51,18 @@ function getTabClientId() {
   return window.__anyTogetherClientId;
 }
 
-function isLocalUiUrl(value) {
-  return String(value || "").includes("localhost:3000");
+function isCurrentUiUrl(value) {
+  try {
+    return new URL(String(value || ""), window.location.href).origin === window.location.origin;
+  } catch {
+    return false;
+  }
 }
 
 function pickResolverPageUrl(...candidates) {
   for (const candidate of candidates) {
     if (typeof candidate !== "string" || !candidate) continue;
-    if (isLocalUiUrl(candidate)) continue;
+    if (isCurrentUiUrl(candidate)) continue;
     return candidate;
   }
   return null;

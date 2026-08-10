@@ -8,6 +8,7 @@ const EXTENSION_STATUS_EVENT = "WT_EXTENSION_STATUS";
 const EXTENSION_ERROR_EVENT = "WT_EXTENSION_ERROR";
 const PAGE_EVENT_SEARCH_RESULT_CLICKED = "WT_SEARCH_RESULT_CLICKED";
 const SEARCH_POPUP_WINDOW_NAME = "AnyTogetherSearch";
+const UI_REGISTRATION_EVENT = "WT_UI_REGISTER";
 
 function sendRuntimeMessage(message) {
   try {
@@ -21,7 +22,8 @@ function sendRuntimeMessage(message) {
   const isIframe = window !== window.top;
   const pageUrl = window.location.href;
   const isSearchPopupWindow = window.name === SEARCH_POPUP_WINDOW_NAME;
-  const isLocalUiPage = pageUrl.includes("localhost:3000");
+  let isUiPage = false;
+  let mediaObserver = null;
 
   console.log("[AnyTogether CS] Loaded at:", pageUrl, "| isIframe:", isIframe);
 
@@ -167,13 +169,13 @@ function sendRuntimeMessage(message) {
 
   let _lastMediaUrl = null;
 
-  if (!isLocalUiPage) {
+  if (!isUiPage) {
     document.querySelectorAll('video, video source, source').forEach(el => {
       const url = el.currentSrc || el.src || '';
       if (isValidMediaUrl(url)) sendMediaUrlToUi(url, window.location.href);
     });
 
-    const observer = new MutationObserver(() => {
+    mediaObserver = new MutationObserver(() => {
       document.querySelectorAll('video, video source, source').forEach(el => {
         const url = el.currentSrc || el.src || '';
         if (isValidMediaUrl(url)) sendMediaUrlToUi(url, window.location.href);
@@ -181,7 +183,7 @@ function sendRuntimeMessage(message) {
     });
 
     const target = document.querySelector('body') || document.documentElement;
-    if (target) observer.observe(target, { childList: true, subtree: true });
+    if (target) mediaObserver.observe(target, { childList: true, subtree: true });
   }
 
   let _monitoredUrls = new Set();
@@ -193,6 +195,12 @@ function sendRuntimeMessage(message) {
     if (event.source !== window && !fromParent) return;
 
   if (event.data?.type === PAGE_TO_EXTENSION_PING_EVENT) {
+    isUiPage = true;
+    mediaObserver?.disconnect();
+    sendRuntimeMessage({
+      type: UI_REGISTRATION_EVENT,
+      payload: { pageUrl }
+    });
     postToPage(EXTENSION_STATUS_EVENT, {
       message: "Extension detected",
       probe: true
@@ -232,7 +240,7 @@ function sendRuntimeMessage(message) {
     }
     if (message?.type === "WT_MEDIA_FOUND" && message?.payload) {
       _lastMediaUrl = message.payload.mediaUrl || _lastMediaUrl;
-      if (pageUrl.includes("localhost:3000")) {
+      if (isUiPage) {
         persistPendingMediaPayload(message.payload);
       }
       postToPage("WT_MEDIA_FOUND", message.payload);

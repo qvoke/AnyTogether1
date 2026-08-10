@@ -33,6 +33,7 @@ const UI = {
 let _isDragging = false;
 let _isVolumeDragging = false;
 let _menuOpen = false;
+let _pendingSeekPosition = null;
 
 // Transient play and pause indicators
 let _actionIconTimer = null;
@@ -153,23 +154,26 @@ function bindEvents() {
   // Progress bar drag
   UI.progressBar.addEventListener('mousedown', (e) => {
     _isDragging = true;
-    seekFromMouse(e);
+    previewSeekFromMouse(e);
     document.addEventListener('mousemove', onDrag);
     document.addEventListener('mouseup', onEnd);
   });
-  function onDrag(e) { if (_isDragging) { seekFromMouse(e); UI.progressBar.classList.add('seeking'); } }
+  function onDrag(e) { if (_isDragging) { previewSeekFromMouse(e); UI.progressBar.classList.add('seeking'); } }
   function onEnd() {
     _isDragging = false;
     UI.progressBar.classList.remove('seeking');
     document.removeEventListener('mousemove', onDrag);
     document.removeEventListener('mouseup', onEnd);
+    const position = _pendingSeekPosition;
+    _pendingSeekPosition = null;
+    if (Number.isFinite(position)) window.anyTogetherSyncBridge?.seek(position);
   }
-  function seekFromMouse(e) {
+  function previewSeekFromMouse(e) {
     const rect = UI.progressBar.getBoundingClientRect();
     const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
     // Immediate visual feedback prevents a delayed media event from making the control feel stuck.
     setProgressVisual(pct);
-    if (video.duration) window.anyTogetherSyncBridge?.seek(pct * video.duration);
+    _pendingSeekPosition = video.duration ? pct * video.duration : null;
   }
 
   // Volume
@@ -334,7 +338,7 @@ function updateTime() {
 }
 
 function updateProgress() {
-  if (!video || !video.duration || !UI.progressFill || !UI.progressHandle) return;
+  if (_isDragging || !video || !video.duration || !UI.progressFill || !UI.progressHandle) return;
   const pct = Math.min(100, (video.currentTime / video.duration) * 100);
   UI.progressFill.style.width = `${pct}%`;
   UI.progressHandle.style.left = `${pct}%`;

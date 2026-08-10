@@ -1,5 +1,6 @@
 import { getParserConfigForUrl } from "./parser-configs.js";
 import { extractSeriesContextInPage } from "./extraction-engine.js";
+import { createUiRegistry, UI_REGISTRATION_STORAGE_KEY } from "./ui-registry.js";
 
 const SEARCH_REQUEST_EVENT = "WT_SEARCH_REQUEST";
 const RESOLVE_PAGE_REQUEST_EVENT = "WT_RESOLVE_PAGE_URL";
@@ -7,8 +8,26 @@ const SERIES_CONTEXT_FOUND_EVENT = "WT_SERIES_CONTEXT_FOUND";
 const EXTRACTION_DIAGNOSTIC_EVENT = "WT_EXTRACTION_DIAGNOSTIC";
 const EXTENSION_STATUS_EVENT = "WT_EXTENSION_STATUS";
 const EXTENSION_ERROR_EVENT = "WT_EXTENSION_ERROR";
+const UI_REGISTRATION_EVENT = "WT_UI_REGISTER";
 const MEDIA_URL_REGEX = /https?:\/\/[^\s"'<>]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>]*)?/i;
 const FORWARDED_SERIES_CONTEXT_SIGNATURES = new Map();
+const UI_REGISTRY = createUiRegistry();
+
+function persistUiRegistry() {
+  chrome.storage.session?.set(
+    { [UI_REGISTRATION_STORAGE_KEY]: UI_REGISTRY.serialize() },
+    () => void chrome.runtime.lastError
+  );
+}
+
+function registerUiTab(tabId, pageUrl) {
+  UI_REGISTRY.register(tabId, pageUrl);
+  persistUiRegistry();
+}
+
+chrome.storage.session?.get([UI_REGISTRATION_STORAGE_KEY], (result) => {
+  UI_REGISTRY.hydrate(result?.[UI_REGISTRATION_STORAGE_KEY]);
+});
 
 function sendStatus(tabId, message) {
   if (typeof tabId !== "number") return;
@@ -81,7 +100,7 @@ function sendSeriesContextToUi(tabId, pageUrl, seriesContext) {
   chrome.tabs.query({}, (tabs) => {
     if (!tabs) return;
     for (const tab of tabs) {
-      if (tab.status === "complete" && tab.url?.includes("localhost:3000")) {
+      if (tab.status === "complete" && UI_REGISTRY.isTab(tab)) {
         sendTabMessage(tab.id, message);
       }
     }
@@ -1717,7 +1736,7 @@ function forwardToUi(url) {
   console.log("[Background] Forwarding to UI:", (realUrl || url).substring(0, 100));
   chrome.tabs.query({}, (allTabs) => {
     if (!allTabs) return;
-    allTabs.filter(t => t.status === 'complete' && t.url && t.url.includes('localhost:3000'))
+    allTabs.filter(t => t.status === 'complete' && UI_REGISTRY.isTab(t))
       .forEach(tab => {
         sendTabMessage(tab.id, {
           type: "WT_SEARCH_RESULT_CLICKED",
@@ -1754,7 +1773,7 @@ chrome.webNavigation.onCreatedNavigationTarget.addListener((details) => {
   if (details.sourceTabId > 0) {
     try {
       chrome.tabs.get(details.sourceTabId, (tab) => {
-        if (tab && tab.url && tab.url.includes('localhost:3000')) {
+        if (tab && UI_REGISTRY.isTab(tab)) {
           _searchPopupTabId = details.tabId;
           SEARCH_POPUP_OWNER_TABS.set(details.tabId, details.sourceTabId);
           console.log("[Background] Search popup tab tracked:", _searchPopupTabId);
@@ -1815,6 +1834,8 @@ chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
 
 // Reset popup tab tracking when that tab closes
 chrome.tabs.onRemoved.addListener((tabId) => {
+  UI_REGISTRY.remove(tabId);
+  persistUiRegistry();
   if (tabId === _searchPopupTabId) {
     _searchPopupTabId = null;
   }
@@ -1884,7 +1905,7 @@ function isMediaLikePageUrl(value) {
 function pickSourcePageUrl(...candidates) {
   for (const candidate of candidates) {
     if (typeof candidate !== "string" || !candidate) continue;
-    if (candidate.includes("localhost:3000")) continue;
+    if (UI_REGISTRY.isUrl(candidate)) continue;
     if (isExtensionPageUrl(candidate) || isMediaLikePageUrl(candidate)) continue;
     return candidate;
   }
@@ -1894,7 +1915,7 @@ function pickSourcePageUrl(...candidates) {
 // Sniff media URLs (m3u8/mp4) from sites the user visits in the popup
 // and forward them to our UI page for playback.
 // Only active when user explicitly enables it via the sniffer toggle button.
-// Skip requests from our own page (localhost:3000) to avoid loops.
+// Skip requests from registered UI pages to avoid forwarding playback back into itself.
 const MEDIA_SNIFFER_UI_CACHE = new Set();
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
@@ -1911,10 +1932,10 @@ chrome.webRequest.onBeforeRequest.addListener(
       return;
     }
 
-    if (details.initiator && details.initiator.includes('localhost:3000')) {
+    if (UI_REGISTRY.isTabId(tabId) || UI_REGISTRY.isUrl(details.initiator)) {
       return;
     }
-    if (details.documentUrl && details.documentUrl.includes('localhost:3000')) {
+    if (UI_REGISTRY.isUrl(details.documentUrl)) {
       return;
     }
 
@@ -1931,7 +1952,7 @@ chrome.webRequest.onBeforeRequest.addListener(
 
     chrome.tabs.query({}, (allTabs) => {
       if (!allTabs || !allTabs.length) return;
-      const uiTabs = allTabs.filter(t => t.status === 'complete' && t.url && t.url.includes('localhost:3000'));
+      const uiTabs = allTabs.filter(t => t.status === 'complete' && UI_REGISTRY.isTab(t));
 
       for (const tab of uiTabs) {
         MEDIA_SNIFFER_UI_CACHE.add(tab.id);
@@ -2000,7 +2021,7 @@ function sendMediaPayloadToUi(targetUiTabId, payload) {
     allTabs
       .filter((tab) =>
         tab.status === "complete" &&
-        tab.url?.includes("localhost:3000") &&
+        UI_REGISTRY.isTab(tab) &&
         (!Number.isFinite(targetUiTabId) || tab.id === targetUiTabId)
       )
       .forEach((tab) => {
@@ -2137,6 +2158,12 @@ keepAlive();
 const CS_FORWARD_EVENT = "WT_SEARCH_RESULT_CLICKED";
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === UI_REGISTRATION_EVENT) {
+    registerUiTab(sender?.tab?.id, message.payload?.pageUrl || sender?.tab?.url);
+    sendResponse({ ok: true });
+    return;
+  }
+
   // Handle sniffer state toggle from UI
   if (message?.type === "WT_SNIFFER_STATE") {
     _snifferActive = message.payload?.active === true;
@@ -2211,8 +2238,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       allTabs
         .filter((tab) =>
           tab.status === "complete" &&
-          tab.url &&
-          tab.url.includes("localhost:3000") &&
+          UI_REGISTRY.isTab(tab) &&
           (!Number.isFinite(targetUiTabId) || tab.id === targetUiTabId)
         )
         .forEach((tab) => {
