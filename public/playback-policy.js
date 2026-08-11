@@ -12,3 +12,13 @@ export function getRelativeSeekPosition(roomState, serverTimeMs, deltaSec, durat
   }
   return Math.min(target, Math.max(0, duration - 0.04));
 }
+
+export function getPlaybackToggleIntent(roomState, localPaused) {
+  if (!roomState?.media) {
+    return null;
+  }
+  if (!roomState.playback.paused && localPaused) {
+    return "activate";
+  }
+  return roomState.playback.paused ? "play" : "pause";
+}

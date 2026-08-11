@@ -210,8 +210,30 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
     expect.poll(async () => (await pipelineState(second.page))?.ready).toBe(true)
   ]);
 
+  await second.page.locator("#player").evaluate((video) => {
+    const play = video.play.bind(video);
+    let rejectOnce = true;
+    video.play = () => {
+      if (rejectOnce) {
+        rejectOnce = false;
+        return Promise.reject(new DOMException("Playback requires local activation", "NotAllowedError"));
+      }
+      return play();
+    };
+  });
+
   const playStartedAt = Date.now();
   await togglePlayback(first.page);
+  await expect.poll(async () => (await pipelineState(second.page))?.activationNeeded).toBe(true);
+  const blockedVersion = (await pipelineState(second.page)).version;
+  const blockedPosition = await second.page.locator("#player").evaluate((video) => video.currentTime);
+  await second.page.waitForTimeout(3_200);
+  const blockedPositionAfterReconciliation = await second.page.locator("#player").evaluate((video) => video.currentTime);
+  expect(Math.abs(blockedPositionAfterReconciliation - blockedPosition)).toBeLessThan(0.25);
+  await togglePlayback(second.page);
+  await expect.poll(async () => (await pipelineState(second.page))?.activationNeeded).toBe(false);
+  await expect.poll(() => second.page.locator("#player").evaluate((video) => video.paused)).toBe(false);
+  expect((await pipelineState(second.page)).version).toBe(blockedVersion);
   await waitForPlayback(first.page, second.page, undefined, syncLog, persistSyncLog, playStartedAt);
 
   const random = createRandom(config.randomSeed);

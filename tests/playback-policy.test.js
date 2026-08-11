@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  getPlaybackToggleIntent,
   getRelativeSeekPosition
 } from "../public/playback-policy.js";
 
@@ -25,4 +26,14 @@ test("the active room document contains one playable video element", async () =>
   const players = activeHtml.match(/<video\b[^>]*\bid=["']player["'][^>]*>/gi) ?? [];
 
   assert.equal(players.length, 1);
+});
+
+test("a locally blocked participant activates playback without pausing the room", () => {
+  const playingRoom = { media: { id: "media-1" }, playback: { paused: false } };
+  const pausedRoom = { media: { id: "media-1" }, playback: { paused: true } };
+
+  assert.equal(getPlaybackToggleIntent(playingRoom, true), "activate");
+  assert.equal(getPlaybackToggleIntent(playingRoom, false), "pause");
+  assert.equal(getPlaybackToggleIntent(pausedRoom, true), "play");
+  assert.equal(getPlaybackToggleIntent({ media: null, playback: { paused: true } }, true), null);
 });

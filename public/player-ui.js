@@ -205,6 +205,14 @@ function bindEvents() {
     }
   });
 
+  window.addEventListener('anytogether:playback-activation', (event) => {
+    const activationNeeded = event.detail?.needed === true;
+    UI.playBtn.classList.toggle('activation-needed', activationNeeded);
+    UI.playBtn.title = activationNeeded ? 'Enable playback with sound' : 'Play/Pause';
+    UI.playBtn.setAttribute('aria-label', UI.playBtn.title);
+    updatePlayBtn();
+  });
+
   UI.settingsBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     if (window.toggleSettingsPanel) {

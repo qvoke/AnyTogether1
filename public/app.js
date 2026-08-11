@@ -1,4 +1,4 @@
-import { getRelativeSeekPosition } from "./playback-policy.js";
+import { getPlaybackToggleIntent, getRelativeSeekPosition } from "./playback-policy.js";
 
 const elements = {
   activeRoom: document.getElementById("activeRoom"),
@@ -84,7 +84,9 @@ function recordPlaybackEvent(type, player) {
     at: Date.now(),
     currentTime: player.currentTime,
     readyState: player.readyState,
-    paused: player.paused
+    paused: player.paused,
+    muted: player.muted,
+    volume: player.volume
   });
   if (state.playbackEvents.length > 500) {
     state.playbackEvents.splice(0, state.playbackEvents.length - 500);
@@ -102,6 +104,16 @@ function setPlaybackState() {
     return;
   }
   elements.playbackState.textContent = elements.player.paused ? "Paused" : "Playing";
+}
+
+function setPlaybackBlocked(blocked) {
+  if (state.playbackBlocked === blocked) {
+    return;
+  }
+  state.playbackBlocked = blocked;
+  window.dispatchEvent(new CustomEvent("anytogether:playback-activation", {
+    detail: { needed: blocked }
+  }));
 }
 
 function estimateServerNow() {
@@ -338,6 +350,11 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
     }
     player.playbackRate = 1;
   } else {
+    if (state.playbackBlocked) {
+      player.playbackRate = 1;
+      setPlaybackState();
+      return;
+    }
     if (absoluteError > HARD_SYNC_THRESHOLD_SEC || player.paused) {
       setRemotePosition(player, expectedPosition);
       startHlsLoadForState(roomState, expectedPosition);
@@ -378,7 +395,7 @@ function requestAuthoritativePlayback(player) {
   }
   state.remotePlayUntil = performance.now() + 10_000;
   void player.play().catch(() => {
-    state.playbackBlocked = true;
+    setPlaybackBlocked(true);
     state.remotePlayUntil = 0;
     logSyncEvent("Playback needs local activation", "Click the player once to allow audio playback.");
   });
@@ -415,7 +432,7 @@ function loadSource(media) {
   }
 
   state.sourceId = media.id;
-  state.playbackBlocked = false;
+  setPlaybackBlocked(false);
   if (elements.mediaUrl) {
     elements.mediaUrl.value = media.url;
   }
@@ -527,6 +544,7 @@ function bindPlayerEvents() {
     logSyncEvent("Buffering media at the shared position.");
   });
   player.addEventListener("playing", () => {
+    setPlaybackBlocked(false);
     state.remotePlayUntil = 0;
     recordPlaybackEvent("playing", player);
     logSyncEvent("Playing in sync.");
@@ -565,7 +583,7 @@ function bindPlayerEvents() {
 }
 
 function requestAutoplay() {
-  state.playbackBlocked = false;
+  setPlaybackBlocked(false);
   synchronizePlayer("requested-autoplay");
 }
 
@@ -581,18 +599,23 @@ window.anyTogetherSyncBridge = {
     return loadInterfaceMedia(url, forceReload);
   },
   play() {
-    state.playbackBlocked = false;
+    setPlaybackBlocked(false);
     return sendAction({ type: "play" });
   },
   pause() {
     return sendAction({ type: "pause" });
   },
   toggle() {
-    if (!state.roomState?.media) {
+    const intent = getPlaybackToggleIntent(state.roomState, elements.player?.paused !== false);
+    if (!intent) {
       return false;
     }
-    state.playbackBlocked = false;
-    return sendAction({ type: state.roomState.playback.paused ? "play" : "pause" });
+    if (intent === "activate") {
+      requestAutoplay();
+      return true;
+    }
+    setPlaybackBlocked(false);
+    return sendAction({ type: intent });
   },
   seekBy(deltaSec) {
     if (!state.roomState?.media) {
@@ -641,6 +664,7 @@ window.__getPlaybackSyncInfo = (participantClientId = state.clientId) => {
   return { active: true, buffering: elements.player?.readyState < HTMLMediaElement.HAVE_FUTURE_DATA, offsetMs: state.lastSyncErrorMs };
 };
 window.__getPlaybackPipelineState = () => ({
+  activationNeeded: state.playbackBlocked,
   connected: isSocketOpen(),
   hlsActive: Boolean(state.hls),
   mediaUrl: state.roomState?.media?.url || "",
