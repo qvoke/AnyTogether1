@@ -39,6 +39,14 @@ const MAX_MESSAGE_BYTES = 8_192;
 const MAX_RECENT_ACTION_IDS = 128;
 const OPEN = 1;
 
+interface StoredSyncRuntime {
+  actionIds: string[];
+  expiresAtMs: number | null;
+  roomCurrentMedia: UiMedia | null;
+  roomUpdatedAtMs: number | null;
+  syncState: unknown;
+}
+
 export class RoomDurableObject implements DurableObject {
   private actionIds: string[] = [];
   private chat: ChatMessage[] = [];
@@ -47,6 +55,7 @@ export class RoomDurableObject implements DurableObject {
   private playlist: PlaylistItem[] = [];
   private readonly ready: Promise<void>;
   private room: StoredRoom | null = null;
+  private syncRuntimeSqlReady = false;
   private syncExpiresAtMs: number | null = null;
   private syncState = createEmptyRoomState(Date.now());
 
@@ -207,6 +216,7 @@ export class RoomDurableObject implements DurableObject {
       for (const socket of this.state.getWebSockets()) {
         socket.close(1000, "Room deleted");
       }
+      this.clearSyncRuntimeSql();
       await this.state.storage.deleteAll();
       this.room = null;
       this.chat = [];
@@ -264,6 +274,7 @@ export class RoomDurableObject implements DurableObject {
       return;
     }
 
+    const previousExpiry = this.syncExpiresAtMs;
     const serverTimeMs = Date.now();
     if (action.type === "setMedia") {
       const validated = validateMediaUrl(action.url);
@@ -302,11 +313,16 @@ export class RoomDurableObject implements DurableObject {
     if (this.room) {
       syncStorage[ROOM_KEY] = this.room;
     }
-    await this.state.storage.put(syncStorage, { allowUnconfirmed: true });
-    await this.scheduleNextAlarm(true);
+    const storageWrite = this.persistSyncRuntimeSql()
+      ? Promise.resolve()
+      : this.state.storage.put(syncStorage, { allowUnconfirmed: true });
+    const alarmWrite = previousExpiry === null ? this.scheduleNextAlarm(true) : Promise.resolve();
     this.broadcastSyncSnapshot();
     if (action.type === "setMedia") {
       this.broadcastUiSnapshot();
+    }
+    await Promise.all([storageWrite, alarmWrite]);
+    if (action.type === "setMedia") {
       this.queueSummaryPersistence();
     }
   }
@@ -695,6 +711,7 @@ export class RoomDurableObject implements DurableObject {
       this.send(socket, { type: "room:error", roomId: this.room.code, message: validated.error });
       return;
     }
+    const previousExpiry = this.syncExpiresAtMs;
     const timestamp = Date.now();
     const action: RoomAction = {
       type: "setMedia",
@@ -710,13 +727,17 @@ export class RoomDurableObject implements DurableObject {
     this.syncExpiresAtMs = timestamp + ROOM_TTL_MS;
     this.room.currentMedia = { ...metadata, updatedAt: timestamp };
     this.room.lastUpdatedAt = timestamp;
-    await Promise.all([
-      this.state.storage.put(SYNC_STATE_KEY, this.syncState),
-      this.state.storage.put(ACTION_IDS_KEY, this.actionIds),
-      this.state.storage.put(SYNC_EXPIRY_KEY, this.syncExpiresAtMs),
-      this.state.storage.put(ROOM_KEY, this.room),
-    ]);
-    await this.scheduleNextAlarm();
+    if (!this.persistSyncRuntimeSql()) {
+      await Promise.all([
+        this.state.storage.put(SYNC_STATE_KEY, this.syncState),
+        this.state.storage.put(ACTION_IDS_KEY, this.actionIds),
+        this.state.storage.put(SYNC_EXPIRY_KEY, this.syncExpiresAtMs),
+        this.state.storage.put(ROOM_KEY, this.room),
+      ]);
+    }
+    if (previousExpiry === null) {
+      await this.scheduleNextAlarm();
+    }
     this.broadcastSyncSnapshot();
     this.broadcastUi({
       type: "media:set",
@@ -748,6 +769,7 @@ export class RoomDurableObject implements DurableObject {
       currentMedia: null,
     };
     this.syncState = createEmptyRoomState(timestamp);
+    this.persistSyncRuntimeSql();
     await Promise.all([
       this.state.storage.put(ROOM_KEY, this.room),
       this.state.storage.put(SYNC_STATE_KEY, this.syncState),
@@ -756,6 +778,7 @@ export class RoomDurableObject implements DurableObject {
   }
 
   private async restore(): Promise<void> {
+    const sqlRuntime = this.readSyncRuntimeSql();
     const [room, syncState, actionIds, chat, playlist, participants, syncExpiry, offlineDeadlines] = await Promise.all([
       this.state.storage.get<StoredRoom>(ROOM_KEY),
       this.state.storage.get<unknown>(SYNC_STATE_KEY),
@@ -767,14 +790,27 @@ export class RoomDurableObject implements DurableObject {
       this.state.storage.get<Record<string, number>>(OFFLINE_DEADLINES_KEY),
     ]);
     this.room = room ?? null;
-    if (isRoomState(syncState)) {
-      this.syncState = syncState;
+    const restoredSyncState = sqlRuntime?.syncState ?? syncState;
+    if (isRoomState(restoredSyncState)) {
+      this.syncState = restoredSyncState;
     }
-    this.actionIds = Array.isArray(actionIds) ? actionIds.filter((id) => typeof id === "string").slice(-MAX_RECENT_ACTION_IDS) : [];
+    const restoredActionIds = sqlRuntime?.actionIds ?? actionIds;
+    this.actionIds = Array.isArray(restoredActionIds)
+      ? restoredActionIds.filter((id) => typeof id === "string").slice(-MAX_RECENT_ACTION_IDS)
+      : [];
     this.chat = Array.isArray(chat) ? chat : [];
     this.playlist = Array.isArray(playlist) ? playlist : [];
     this.participants = Array.isArray(participants) ? participants : [];
-    this.syncExpiresAtMs = typeof syncExpiry === "number" && Number.isFinite(syncExpiry) ? syncExpiry : null;
+    const restoredExpiry = sqlRuntime ? sqlRuntime.expiresAtMs : syncExpiry;
+    this.syncExpiresAtMs = typeof restoredExpiry === "number" && Number.isFinite(restoredExpiry) ? restoredExpiry : null;
+    if (
+      this.room &&
+      typeof sqlRuntime?.roomUpdatedAtMs === "number" &&
+      sqlRuntime.roomUpdatedAtMs >= this.room.lastUpdatedAt
+    ) {
+      this.room.currentMedia = sqlRuntime.roomCurrentMedia;
+      this.room.lastUpdatedAt = sqlRuntime.roomUpdatedAtMs;
+    }
     this.offlineDeadlines = isRecord(offlineDeadlines)
       ? Object.fromEntries(Object.entries(offlineDeadlines).filter((entry): entry is [string, number] => typeof entry[1] === "number"))
       : {};
@@ -901,14 +937,75 @@ export class RoomDurableObject implements DurableObject {
   }
 
   private async persistVolatileState(): Promise<void> {
+    const sqlPersisted = this.persistSyncRuntimeSql();
     await Promise.all([
       this.state.storage.put(PARTICIPANTS_KEY, this.participants),
       this.state.storage.put(OFFLINE_DEADLINES_KEY, this.offlineDeadlines),
-      this.syncExpiresAtMs === null
-        ? this.state.storage.delete(SYNC_EXPIRY_KEY)
-        : this.state.storage.put(SYNC_EXPIRY_KEY, this.syncExpiresAtMs),
-      this.room ? this.state.storage.put(ROOM_KEY, this.room) : Promise.resolve(),
+      sqlPersisted
+        ? Promise.resolve()
+        : this.syncExpiresAtMs === null
+          ? this.state.storage.delete(SYNC_EXPIRY_KEY)
+          : this.state.storage.put(SYNC_EXPIRY_KEY, this.syncExpiresAtMs),
+      sqlPersisted || !this.room ? Promise.resolve() : this.state.storage.put(ROOM_KEY, this.room),
     ]);
+  }
+
+  private clearSyncRuntimeSql(): void {
+    const sql = this.state.storage.sql;
+    if (sql) {
+      sql.exec("DROP TABLE IF EXISTS sync_runtime");
+      this.syncRuntimeSqlReady = false;
+    }
+  }
+
+  private ensureSyncRuntimeSql(): DurableObjectStorage["sql"] | null {
+    const sql = this.state.storage.sql;
+    if (!sql) {
+      return null;
+    }
+    if (!this.syncRuntimeSqlReady) {
+      sql.exec(`CREATE TABLE IF NOT EXISTS sync_runtime (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        payload TEXT NOT NULL
+      )`);
+      this.syncRuntimeSqlReady = true;
+    }
+    return sql;
+  }
+
+  private persistSyncRuntimeSql(): boolean {
+    const sql = this.ensureSyncRuntimeSql();
+    if (!sql) {
+      return false;
+    }
+    const payload: StoredSyncRuntime = {
+      actionIds: this.actionIds,
+      expiresAtMs: this.syncExpiresAtMs,
+      roomCurrentMedia: this.room?.currentMedia ?? null,
+      roomUpdatedAtMs: this.room?.lastUpdatedAt ?? null,
+      syncState: this.syncState,
+    };
+    sql.exec(
+      "INSERT INTO sync_runtime (id, payload) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
+      JSON.stringify(payload),
+    );
+    return true;
+  }
+
+  private readSyncRuntimeSql(): StoredSyncRuntime | null {
+    const sql = this.ensureSyncRuntimeSql();
+    if (!sql) {
+      return null;
+    }
+    const row = Array.from(sql.exec<{ payload: string }>("SELECT payload FROM sync_runtime WHERE id = 1"))[0];
+    if (!row) {
+      return null;
+    }
+    try {
+      return JSON.parse(row.payload) as StoredSyncRuntime;
+    } catch {
+      return null;
+    }
   }
 
   private async persistSummary(): Promise<void> {

@@ -22,3 +22,21 @@ export function getPlaybackToggleIntent(roomState, localPaused) {
   }
   return roomState.playback.paused ? "play" : "pause";
 }
+
+export function isPositionBuffered(buffered, positionSec) {
+  for (let index = 0; index < buffered.length; index += 1) {
+    if (positionSec >= buffered.start(index) - 0.04 && positionSec <= buffered.end(index) - 0.04) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function shouldDeferHlsCorrection(roomState, player, remoteSeek, expectedPosition) {
+  return Boolean(
+    roomState.media?.kind === "hls" &&
+    !roomState.playback.paused &&
+    remoteSeek?.version === roomState.version &&
+    !isPositionBuffered(player.buffered, expectedPosition)
+  );
+}

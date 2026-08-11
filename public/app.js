@@ -1,4 +1,8 @@
-import { getPlaybackToggleIntent, getRelativeSeekPosition } from "./playback-policy.js";
+import {
+  getPlaybackToggleIntent,
+  getRelativeSeekPosition,
+  shouldDeferHlsCorrection
+} from "./playback-policy.js";
 
 const elements = {
   activeRoom: document.getElementById("activeRoom"),
@@ -31,6 +35,7 @@ const state = {
   playbackBlocked: false,
   reconnectTimer: null,
   remotePlayUntil: 0,
+  remoteSeek: null,
   pendingSeek: null,
   resetRateTimer: null,
   roomId: null,
@@ -345,7 +350,7 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
       player.pause();
     }
     if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
-      setRemotePosition(player, expectedPosition);
+      setRemotePosition(player, expectedPosition, roomState);
       startHlsLoadForState(roomState, expectedPosition);
     }
     player.playbackRate = 1;
@@ -355,8 +360,24 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
       setPlaybackState();
       return;
     }
-    if (absoluteError > HARD_SYNC_THRESHOLD_SEC || player.paused) {
-      setRemotePosition(player, expectedPosition);
+    const requiresHardCorrection = absoluteError > HARD_SYNC_THRESHOLD_SEC || player.paused;
+    if (
+      requiresHardCorrection &&
+      shouldDeferHlsCorrection(roomState, player, state.remoteSeek, expectedPosition)
+    ) {
+      player.playbackRate = 1;
+      storeDiagnostic({
+        type: "hls-correction-deferred",
+        errorMs: state.lastSyncErrorMs,
+        reason,
+        version: roomState.version
+      });
+      requestAuthoritativePlayback(player);
+      setPlaybackState();
+      return;
+    }
+    if (requiresHardCorrection) {
+      setRemotePosition(player, expectedPosition, roomState);
       startHlsLoadForState(roomState, expectedPosition);
     } else if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
       player.playbackRate = error > 0 ? 1.04 : 0.96;
@@ -401,7 +422,10 @@ function requestAuthoritativePlayback(player) {
   });
 }
 
-function setRemotePosition(player, positionSec) {
+function setRemotePosition(player, positionSec, roomState) {
+  state.remoteSeek = roomState.media?.kind === "hls"
+    ? { positionSec, version: roomState.version }
+    : null;
   player.currentTime = positionSec;
 }
 
@@ -411,6 +435,7 @@ function unloadSource() {
   state.hls = null;
   state.lastHlsRecoveryAt = 0;
   state.lastHlsLoadVersion = null;
+  state.remoteSeek = null;
   state.sourceId = null;
   if (!player) {
     return;

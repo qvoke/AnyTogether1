@@ -289,7 +289,7 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   }
 
   const versionBeforePause = (await pipelineState(first.page)).version;
-  await togglePlayback(first.page);
+  expect(await first.page.evaluate(() => window.anyTogetherSyncBridge?.pause())).toBe(true);
   await expect.poll(
     async () => (await pipelineState(first.page))?.version,
     { timeout: 15_000 }
@@ -300,7 +300,7 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   await expect.poll(async () => (await pipelineState(second.page))?.paused).toBe(true);
 
   const versionBeforeResume = (await pipelineState(first.page)).version;
-  await togglePlayback(first.page);
+  expect(await first.page.evaluate(() => window.anyTogetherSyncBridge?.play())).toBe(true);
   await expect.poll(
     async () => (await pipelineState(first.page))?.version,
     { timeout: 15_000 }

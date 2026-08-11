@@ -3,7 +3,9 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   getPlaybackToggleIntent,
-  getRelativeSeekPosition
+  getRelativeSeekPosition,
+  isPositionBuffered,
+  shouldDeferHlsCorrection
 } from "../public/playback-policy.js";
 
 test("relative seeks use the authoritative server-time position", () => {
@@ -36,4 +38,29 @@ test("a locally blocked participant activates playback without pausing the room"
   assert.equal(getPlaybackToggleIntent(playingRoom, false), "pause");
   assert.equal(getPlaybackToggleIntent(pausedRoom, true), "play");
   assert.equal(getPlaybackToggleIntent({ media: null, playback: { paused: true } }, true), null);
+});
+
+test("HLS correction waits until the advancing room position is buffered", () => {
+  const roomState = {
+    media: { id: "media-1", kind: "hls" },
+    playback: { paused: false },
+    version: 7
+  };
+  const ranges = [[457, 463]];
+  const buffered = {
+    length: ranges.length,
+    start: (index) => ranges[index][0],
+    end: (index) => ranges[index][1]
+  };
+  const player = { buffered };
+  const remoteSeek = { positionSec: 457, version: 7 };
+
+  assert.equal(isPositionBuffered(buffered, 460), true);
+  assert.equal(isPositionBuffered(buffered, 466), false);
+  assert.equal(shouldDeferHlsCorrection(roomState, player, remoteSeek, 466), true);
+  assert.equal(shouldDeferHlsCorrection(roomState, player, remoteSeek, 460), false);
+  assert.equal(
+    shouldDeferHlsCorrection({ ...roomState, version: 8 }, player, remoteSeek, 466),
+    false
+  );
 });

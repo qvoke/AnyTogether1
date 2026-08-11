@@ -2,9 +2,31 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { RoomDurableObject } from "../worker/room";
 
+class MemorySql {
+  payload: string | null = null;
+
+  exec(query: string, ...bindings: unknown[]) {
+    const normalized = query.trim().toUpperCase();
+    if (normalized.startsWith("INSERT INTO SYNC_RUNTIME")) {
+      this.payload = String(bindings[0]);
+    } else if (normalized.startsWith("DROP TABLE")) {
+      this.payload = null;
+    }
+    if (normalized.startsWith("SELECT PAYLOAD") && this.payload !== null) {
+      return [{ payload: this.payload }];
+    }
+    return [];
+  }
+}
+
 class MemoryStorage {
   alarm: number | Date | null = null;
+  sql: MemorySql | undefined;
   values = new Map<string, unknown>();
+
+  constructor(useSql = false) {
+    this.sql = useSql ? new MemorySql() : undefined;
+  }
 
   async delete(key: string | string[]) {
     for (const item of Array.isArray(key) ? key : [key]) {
@@ -172,6 +194,23 @@ test("restores hibernated state and clears only expired playback", async () => {
   assert.equal(latestSnapshot(verificationSocket).state.media, null);
   assert.deepEqual(storage.values.get("chat"), [{ id: "retained-chat" }]);
   assert.deepEqual(storage.values.get("playlist"), [{ id: "retained-playlist" }]);
+});
+
+test("restores playback from the SQLite runtime row", async () => {
+  const storage = new MemoryStorage(true);
+  const socket = new TestSocket();
+  const first = createRoom(storage, [{ socket, tags: ["sync"] }]);
+  await first.room.webSocketMessage(socket as unknown as WebSocket, JSON.stringify({
+    type: "action",
+    action: action("setMedia", { url: "https://cdn.example.com/movie.mp4" }),
+  }));
+
+  const restoredSocket = new TestSocket();
+  const restored = createRoom(storage, [{ socket: restoredSocket, tags: ["sync"] }]);
+  await restored.room.webSocketMessage(restoredSocket as unknown as WebSocket, JSON.stringify({ type: "hello" }));
+
+  assert.equal(latestSnapshot(restoredSocket).state.version, 1);
+  assert.equal(latestSnapshot(restoredSocket).state.media?.kind, "mp4");
 });
 
 test("an open sync socket extends an expired timeline alarm", async () => {

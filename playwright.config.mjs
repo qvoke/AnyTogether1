@@ -4,6 +4,7 @@ const externalBaseUrl = process.env.E2E_BASE_URL;
 const localPort = Number(process.env.E2E_PORT || 3100);
 const localBaseUrl = `http://127.0.0.1:${localPort}`;
 const reuseExistingServer = process.env.E2E_REUSE_SERVER === "1";
+const retainTrace = process.env.E2E_TRACE === "1";
 const localStatePath = `.notes/build-codex/e2e-cloudflare-state-${Date.now()}`;
 
 export default defineConfig({
@@ -21,7 +22,7 @@ export default defineConfig({
   timeout: 45_000,
   use: {
     baseURL: externalBaseUrl || localBaseUrl,
-    trace: "retain-on-failure",
+    trace: retainTrace ? "retain-on-failure" : "off",
     ...devices["Desktop Chrome"]
   },
   webServer: externalBaseUrl
