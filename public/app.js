@@ -1,6 +1,6 @@
 import {
   getPlaybackToggleIntent,
-  getBufferedCorrectionPosition,
+  getHlsSyncPlaybackRate,
   getRelativeSeekPosition,
   shouldDeferHlsCorrection,
   shouldQueueHlsCorrection
@@ -21,8 +21,8 @@ const RECONNECT_DELAY_MS = 1_200;
 const PERIODIC_SYNC_INTERVAL_MS = 3_000;
 const HARD_SYNC_THRESHOLD_SEC = 0.15;
 const SOFT_SYNC_THRESHOLD_SEC = 0.04;
-const HLS_FOLLOW_UP_INTERVAL_MS = 250;
-const HLS_LATENCY_COMPENSATION_LIMIT_MS = 1_000;
+const HLS_RATE_CORRECTION_INTERVAL_MS = 250;
+const PLAYBACK_TELEMETRY_INTERVAL_MS = 500;
 const HLS_NETWORK_RECOVERY_DELAY_MS = 250;
 const HLS_NETWORK_RECOVERY_LIMIT = 3;
 const Hls = window.Hls;
@@ -38,12 +38,14 @@ const state = {
   hls: null,
   hlsBuffering: false,
   hlsCorrection: null,
-  hlsFollowUpTimer: null,
+  hlsRateCorrectionTimer: null,
   hlsRecoveryTimer: null,
   lastHlsRecoveryAt: 0,
   lastHlsLoadVersion: null,
   lastHlsNetworkRecovery: null,
   lastSyncErrorMs: 0,
+  lastTelemetryAt: 0,
+  lastTelemetrySignature: null,
   playbackBlocked: false,
   reconnectTimer: null,
   remotePlayUntil: 0,
@@ -59,15 +61,22 @@ const state = {
 function getClientId() {
   const storageKey = "anytogether:sync-client-id";
   try {
+    if (typeof window.__anyTogetherClientId === "string" && window.__anyTogetherClientId) {
+      return window.__anyTogetherClientId;
+    }
     const existing = sessionStorage.getItem(storageKey);
     if (existing) {
+      window.__anyTogetherClientId = existing;
       return existing;
     }
     const clientId = crypto.randomUUID();
     sessionStorage.setItem(storageKey, clientId);
+    window.__anyTogetherClientId = clientId;
     return clientId;
   } catch {
-    return crypto.randomUUID();
+    const clientId = crypto.randomUUID();
+    window.__anyTogetherClientId = clientId;
+    return clientId;
   }
 }
 
@@ -161,6 +170,63 @@ function clampPosition(position, duration) {
     return Math.max(0, position);
   }
   return Math.max(0, Math.min(position, Math.max(0, duration - 0.04)));
+}
+
+function getCurrentSyncErrorSec() {
+  const player = elements.player;
+  const roomState = state.roomState;
+  if (!player || !roomState?.media || player.readyState < HTMLMediaElement.HAVE_METADATA) {
+    return 0;
+  }
+  const expectedPosition = clampPosition(getPositionAt(roomState, estimateServerNow()), player.duration);
+  return expectedPosition - player.currentTime;
+}
+
+function getPlaybackSyncInfo() {
+  const player = elements.player;
+  const roomState = state.roomState;
+  const errorMs = Math.round(Math.abs(getCurrentSyncErrorSec()) * 1_000);
+  state.lastSyncErrorMs = errorMs;
+  const buffering = Boolean(
+    player &&
+    roomState?.media &&
+    (state.hlsBuffering || player.seeking || (
+      !roomState.playback.paused && player.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
+    ))
+  );
+  return {
+    active: Boolean(roomState?.media),
+    buffering,
+    offsetMs: errorMs,
+    playbackState: buffering ? "loading" : player?.paused ? "paused" : "playing",
+    version: roomState?.version ?? null
+  };
+}
+
+function emitPlaybackTelemetry(force = false) {
+  if (!state.roomId) {
+    return;
+  }
+  const syncInfo = getPlaybackSyncInfo();
+  const signature = [
+    syncInfo.buffering,
+    Math.round(syncInfo.offsetMs / 10),
+    syncInfo.playbackState,
+    syncInfo.version
+  ].join(":");
+  const now = Date.now();
+  if (!force && signature === state.lastTelemetrySignature && now - state.lastTelemetryAt < PLAYBACK_TELEMETRY_INTERVAL_MS) {
+    return;
+  }
+  state.lastTelemetryAt = now;
+  state.lastTelemetrySignature = signature;
+  window.dispatchEvent(new CustomEvent("anytogether:playback-telemetry", {
+    detail: {
+      ...syncInfo,
+      clientId: state.clientId,
+      roomId: state.roomId
+    }
+  }));
 }
 
 function isSocketOpen() {
@@ -364,7 +430,9 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
   const error = expectedPosition - player.currentTime;
   const absoluteError = Math.abs(error);
   state.lastSyncErrorMs = Math.round(absoluteError * 1_000);
-  storeDiagnostic({ type: "sync", reason, errorMs: state.lastSyncErrorMs, version: roomState.version });
+  if (reason !== "hls-rate-correction") {
+    storeDiagnostic({ type: "sync", reason, errorMs: state.lastSyncErrorMs, version: roomState.version });
+  }
 
   if (roomState.playback.paused) {
     if (!player.paused) {
@@ -374,10 +442,10 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
       setRemotePosition(player, expectedPosition, roomState);
       startHlsLoadForState(roomState, expectedPosition);
     }
-    player.playbackRate = 1;
+    clearHlsRateCorrection(player);
   } else {
     if (state.playbackBlocked) {
-      player.playbackRate = 1;
+      clearHlsRateCorrection(player);
       setPlaybackState();
       return;
     }
@@ -422,16 +490,9 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
     const hasSettledHlsCorrection = roomState.media.kind === "hls" &&
       state.hlsCorrection?.version === roomState.version &&
       !state.hlsCorrection.awaitingPlayback;
-    if (requiresHardCorrection && hasSettledHlsCorrection) {
-      const correctionPosition = getHlsFollowUpPosition(roomState, player);
-      const bufferedPosition = getPlayerBufferedCorrectionPosition(player, correctionPosition);
-      if (!state.hlsCorrection.followUpApplied && bufferedPosition !== null) {
-        setRemotePosition(player, bufferedPosition, roomState, true);
-      } else if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
-        player.playbackRate = error > 0 ? 1.04 : 0.96;
-        resetPlaybackRate(player);
-      }
-      scheduleHlsFollowUpCorrection();
+    if (hasSettledHlsCorrection) {
+      player.playbackRate = getHlsSyncPlaybackRate(error);
+      scheduleHlsRateCorrection(absoluteError);
       requestAuthoritativePlayback(player);
       setPlaybackState();
       return;
@@ -470,77 +531,30 @@ function resetPlaybackRate(player) {
   }, 1_600);
 }
 
-function getPlayerBufferedCorrectionPosition(player, positionSec) {
-  const bufferedRanges = Array.from({ length: player.buffered.length }, (_item, index) => ({
-    end: player.buffered.end(index),
-    start: player.buffered.start(index)
-  }));
-  return getBufferedCorrectionPosition(bufferedRanges, positionSec);
-}
-
-function getHlsFollowUpPosition(roomState, player) {
-  const expectedPosition = getPositionAt(roomState, estimateServerNow());
-  const latencySec = Math.min(
-    HLS_LATENCY_COMPENSATION_LIMIT_MS,
-    Math.max(0, state.hlsCorrection?.settleLatencyMs || 0)
-  ) / 1_000;
-  return clampPosition(expectedPosition + latencySec, player.duration);
-}
-
 function markHlsCorrectionReady(player) {
   const correction = state.hlsCorrection;
   if (!correction || player.paused || player.seeking) {
     return;
   }
-  if (correction.awaitingPlayback && Number.isFinite(correction.startedAtMs)) {
-    correction.settleLatencyMs = Math.min(
-      HLS_LATENCY_COMPENSATION_LIMIT_MS,
-      Math.max(0, performance.now() - correction.startedAtMs)
-    );
-  }
   correction.awaitingPlayback = false;
-  scheduleHlsFollowUpCorrection();
+  scheduleHlsRateCorrection(Math.abs(getCurrentSyncErrorSec()));
 }
 
-function scheduleHlsFollowUpCorrection() {
-  const correction = state.hlsCorrection;
+function scheduleHlsRateCorrection(absoluteError) {
   if (
-    state.hlsFollowUpTimer !== null ||
-    correction?.version !== state.roomState?.version ||
+    state.hlsRateCorrectionTimer !== null ||
+    absoluteError <= SOFT_SYNC_THRESHOLD_SEC ||
+    state.hlsCorrection?.version !== state.roomState?.version ||
     state.roomState?.media?.kind !== "hls" ||
     state.roomState.playback.paused ||
-    correction.awaitingPlayback ||
-    correction.followUpApplied
+    state.hlsCorrection.awaitingPlayback
   ) {
     return;
   }
-  state.hlsFollowUpTimer = window.setTimeout(() => {
-    state.hlsFollowUpTimer = null;
-    const player = elements.player;
-    const roomState = state.roomState;
-    const latestCorrection = state.hlsCorrection;
-    if (
-      !player ||
-      !roomState?.media ||
-      roomState.media.kind !== "hls" ||
-      roomState.playback.paused ||
-      latestCorrection?.version !== roomState.version ||
-      latestCorrection.awaitingPlayback ||
-      latestCorrection.followUpApplied
-    ) {
-      return;
-    }
-    const expectedPosition = clampPosition(getPositionAt(roomState, estimateServerNow()), player.duration);
-    if (Math.abs(expectedPosition - player.currentTime) <= HARD_SYNC_THRESHOLD_SEC) {
-      latestCorrection.followUpApplied = true;
-      return;
-    }
-    const correctionPosition = getHlsFollowUpPosition(roomState, player);
-    if (getPlayerBufferedCorrectionPosition(player, correctionPosition) !== null) {
-      synchronizePlayer("hls-buffer-ready");
-    }
-    scheduleHlsFollowUpCorrection();
-  }, HLS_FOLLOW_UP_INTERVAL_MS);
+  state.hlsRateCorrectionTimer = window.setTimeout(() => {
+    state.hlsRateCorrectionTimer = null;
+    synchronizePlayer("hls-rate-correction");
+  }, HLS_RATE_CORRECTION_INTERVAL_MS);
 }
 
 function requestAuthoritativePlayback(player) {
@@ -555,21 +569,27 @@ function requestAuthoritativePlayback(player) {
   });
 }
 
-function setRemotePosition(player, positionSec, roomState, followUpApplied = false) {
+function setRemotePosition(player, positionSec, roomState) {
   state.deferredHlsCorrection = null;
-  const settleLatencyMs = followUpApplied && state.hlsCorrection?.version === roomState.version
-    ? state.hlsCorrection.settleLatencyMs
-    : 0;
+  clearHlsRateCorrection(player);
   state.hlsCorrection = roomState.media?.kind === "hls"
     ? {
         awaitingPlayback: !roomState.playback.paused,
-        followUpApplied,
-        settleLatencyMs,
-        startedAtMs: performance.now(),
         version: roomState.version
       }
     : null;
+  recordPlaybackEvent("sync-seek", player);
   player.currentTime = positionSec;
+}
+
+function clearHlsRateCorrection(player = elements.player) {
+  if (state.hlsRateCorrectionTimer !== null) {
+    window.clearTimeout(state.hlsRateCorrectionTimer);
+    state.hlsRateCorrectionTimer = null;
+  }
+  if (player) {
+    player.playbackRate = 1;
+  }
 }
 
 function unloadSource(options = {}) {
@@ -581,10 +601,7 @@ function unloadSource(options = {}) {
     window.clearTimeout(state.hlsRecoveryTimer);
     state.hlsRecoveryTimer = null;
   }
-  if (state.hlsFollowUpTimer !== null) {
-    window.clearTimeout(state.hlsFollowUpTimer);
-    state.hlsFollowUpTimer = null;
-  }
+  clearHlsRateCorrection(player);
   state.hls?.destroy();
   state.deferredHlsCorrection = null;
   state.hls = null;
@@ -637,7 +654,6 @@ function loadSource(media, options = {}) {
       }
     });
     hls.on(Hls.Events.FRAG_LOADED, (_event, data) => handleHlsFragmentLoaded(hls, data));
-    hls.on(Hls.Events.FRAG_BUFFERED, () => handleHlsFragmentBuffered(hls));
     hls.on(Hls.Events.ERROR, (_event, data) => handleHlsError(hls, data));
     hls.loadSource(media.url);
     hls.attachMedia(player);
@@ -684,20 +700,6 @@ function handleHlsFragmentLoaded(hls, data) {
       ? Math.max(0, loading.end - loading.start)
       : null
   });
-}
-
-function handleHlsFragmentBuffered(hls) {
-  if (hls !== state.hls) {
-    return;
-  }
-  const correction = state.hlsCorrection;
-  if (
-    correction?.version === state.roomState?.version &&
-    !correction.awaitingPlayback &&
-    !correction.followUpApplied
-  ) {
-    scheduleHlsFollowUpCorrection();
-  }
 }
 
 function handleHlsError(hls, data) {
@@ -855,6 +857,7 @@ function bindPlayerEvents() {
     state.remotePlayUntil = performance.now() + 60_000;
     recordPlaybackEvent("waiting", player);
     logSyncEvent("Buffering media at the shared position.");
+    emitPlaybackTelemetry(true);
   });
   player.addEventListener("playing", () => {
     state.hlsBuffering = false;
@@ -866,6 +869,7 @@ function bindPlayerEvents() {
     if (state.roomState?.media?.kind === "hls") {
       window.setTimeout(() => synchronizePlayer("hls-playing"), 0);
     }
+    emitPlaybackTelemetry(true);
   });
   player.addEventListener("seeking", () => {
     recordPlaybackEvent("seeking", player);
@@ -906,9 +910,6 @@ function bindPlayerEvents() {
 
 function requestAutoplay() {
   setPlaybackBlocked(false);
-  if (state.hlsCorrection?.awaitingPlayback) {
-    state.hlsCorrection.startedAtMs = performance.now();
-  }
   synchronizePlayer("requested-autoplay");
 }
 
@@ -986,7 +987,7 @@ window.__getPlaybackSyncInfo = (participantClientId = state.clientId) => {
   if (participantClientId !== state.clientId) {
     return null;
   }
-  return { active: true, buffering: elements.player?.readyState < HTMLMediaElement.HAVE_FUTURE_DATA, offsetMs: state.lastSyncErrorMs };
+  return getPlaybackSyncInfo();
 };
 window.__getPlaybackPipelineState = () => ({
   activationNeeded: state.playbackBlocked,
@@ -1043,3 +1044,4 @@ window.setInterval(() => {
   }
 }, CLOCK_PING_INTERVAL_MS);
 window.setInterval(() => synchronizePlayer("periodic"), PERIODIC_SYNC_INTERVAL_MS);
+window.setInterval(() => emitPlaybackTelemetry(), PLAYBACK_TELEMETRY_INTERVAL_MS);

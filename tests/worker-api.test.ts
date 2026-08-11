@@ -90,6 +90,34 @@ test("catalog, membership, room state, role transfer, and deletion stay consiste
   successorUi.send({ type: "room:join", roomId: roomCode, nickname: "Room Successor", clientId: "successor-client", hasExtension: true });
   await successorUi.waitFor((message) => message.type === "room:role" && message.role === "guest");
 
+  ownerUi.send({
+    type: "room:playback-status",
+    roomId: roomCode,
+    buffering: false,
+    offsetMs: 487,
+    playbackState: "playing",
+    version: 3,
+  });
+  const playbackStatus = await successorUi.waitFor((message) => message.type === "room:playback-status");
+  assert.deepEqual(playbackStatus, {
+    type: "room:playback-status",
+    roomId: roomCode,
+    buffering: false,
+    clientId: "owner-client",
+    offsetMs: 487,
+    playbackState: "playing",
+    version: 3,
+  });
+  ownerUi.send({
+    type: "room:playback-status",
+    roomId: roomCode,
+    buffering: false,
+    offsetMs: -1,
+    playbackState: "playing",
+    version: 3,
+  });
+  assert.equal((await ownerUi.waitFor((message) => message.type === "room:error")).message, "Invalid playback status.");
+
   ownerUi.send({ type: "chat:message", roomId: roomCode, text: "Hello from D1" });
   await successorUi.waitFor((message) => message.type === "chat:message" && message.message?.text === "Hello from D1");
   ownerUi.send({

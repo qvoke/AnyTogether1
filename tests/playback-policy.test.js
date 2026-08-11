@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   getPlaybackToggleIntent,
-  getBufferedCorrectionPosition,
+  getHlsSyncPlaybackRate,
   getRelativeSeekPosition,
   shouldDeferHlsCorrection,
   shouldQueueHlsCorrection
@@ -41,18 +41,17 @@ test("a locally blocked participant activates playback without pausing the room"
   assert.equal(getPlaybackToggleIntent({ media: null, playback: { paused: true } }, true), null);
 });
 
-test("HLS follow-up corrections only reuse an existing buffered range", () => {
-  const ranges = [
-    { start: 10, end: 20 },
-    { start: 30, end: 40 }
-  ];
-
-  assert.equal(getBufferedCorrectionPosition(ranges, 15), 15);
-  assert.equal(getBufferedCorrectionPosition(ranges, 18.5), null);
-  assert.equal(getBufferedCorrectionPosition(ranges, 20), null);
-  assert.equal(getBufferedCorrectionPosition(ranges, 29.97), 30.05);
-  assert.equal(getBufferedCorrectionPosition(ranges, 25), null);
-  assert.equal(getBufferedCorrectionPosition(ranges, Number.NaN), null);
+test("settled HLS playback converges without another media seek", () => {
+  assert.equal(getHlsSyncPlaybackRate(1.5), 2);
+  assert.equal(getHlsSyncPlaybackRate(-1.5), 0.5);
+  assert.equal(getHlsSyncPlaybackRate(0.7), 1.5);
+  assert.equal(getHlsSyncPlaybackRate(-0.7), 0.5);
+  assert.equal(getHlsSyncPlaybackRate(0.3), 1.3);
+  assert.equal(getHlsSyncPlaybackRate(-0.3), 0.7);
+  assert.equal(getHlsSyncPlaybackRate(0.1), 1.15);
+  assert.equal(getHlsSyncPlaybackRate(-0.1), 0.85);
+  assert.equal(getHlsSyncPlaybackRate(0.04), 1);
+  assert.equal(getHlsSyncPlaybackRate(Number.NaN), 1);
 });
 
 test("HLS correction waits for stable playback after a remote seek", () => {

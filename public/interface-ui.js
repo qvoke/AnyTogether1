@@ -47,6 +47,13 @@ function getTabClientId() {
   if (typeof window.__anyTogetherClientId === "string" && window.__anyTogetherClientId) {
     return window.__anyTogetherClientId;
   }
+  try {
+    const syncClientId = sessionStorage.getItem("anytogether:sync-client-id");
+    if (syncClientId) {
+      window.__anyTogetherClientId = syncClientId;
+      return syncClientId;
+    }
+  } catch {}
   window.__anyTogetherClientId = crypto.randomUUID();
   return window.__anyTogetherClientId;
 }
@@ -224,6 +231,11 @@ let loadedMediaKey = null;
 let pendingSearchStatusTimer = null;
 const pendingRoomJoins = new Set();
 const participantPlaybackStates = new Map();
+const participantSyncStates = new Map();
+window.__getParticipantSyncTelemetry = (participantClientId) => {
+  const telemetry = participantSyncStates.get(participantClientId);
+  return telemetry ? { ...telemetry, playbackState: participantPlaybackStates.get(participantClientId) || "paused" } : null;
+};
 const lastBroadcastSeriesContextSignatures = new Map();
 let pendingMediaSelection = null;
 let _lastLoadedMediaKey = "";
@@ -2796,6 +2808,9 @@ function getParticipantSyncMs(participant) {
     if (Number.isFinite(syncInfo?.offsetMs)) return Math.max(0, Math.round(syncInfo.offsetMs));
   }
 
+  const telemetry = participant?.clientId ? participantSyncStates.get(participant.clientId) : null;
+  if (Number.isFinite(telemetry?.offsetMs)) return Math.max(0, Math.round(telemetry.offsetMs));
+
   const value = Number(participant?.syncOffsetMs ?? participant?.latencyMs ?? participant?.pingMs ?? 0);
   return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
 }
@@ -2805,6 +2820,9 @@ function isParticipantPlaybackLoading(participant) {
     ? participantPlaybackStates.get(participant.clientId)
     : null;
   if (playbackState === "loading") return true;
+
+  const telemetry = participant?.clientId ? participantSyncStates.get(participant.clientId) : null;
+  if (telemetry?.buffering === true) return true;
 
   if (typeof window.__getPlaybackSyncInfo === "function" && participant?.clientId) {
     const syncInfo = window.__getPlaybackSyncInfo(participant.clientId);
@@ -4577,6 +4595,28 @@ function connectWs() {
       return;
     }
 
+    if (msg.type === "room:playback-status") {
+      const roomId = normalizeRoomCode(msg.roomId);
+      if (!roomId || roomId !== state.activeRoomId || !msg.clientId) return;
+      const playbackState = ["loading", "paused", "playing"].includes(msg.playbackState)
+        ? msg.playbackState
+        : "paused";
+      participantPlaybackStates.set(msg.clientId, playbackState);
+      participantSyncStates.set(msg.clientId, {
+        buffering: msg.buffering === true,
+        offsetMs: Number.isFinite(msg.offsetMs) ? Math.max(0, msg.offsetMs) : 0,
+        updatedAt: Date.now(),
+        version: Number.isInteger(msg.version) ? msg.version : null
+      });
+      if (participantsList.querySelector("[data-playback-status]")) {
+        refreshParticipantPlaybackIndicators();
+        refreshParticipantSyncIndicators();
+      } else {
+        renderParticipants();
+      }
+      return;
+    }
+
     if (msg.type === "series-context:set") {
       const roomId = normalizeRoomCode(msg.roomId);
       if (!roomId || msg.originId === clientId) return;
@@ -5097,6 +5137,31 @@ async function start() {
     const title = event.detail?.title || "Playback event";
     const detail = event.detail?.detail || "";
     appendPlaybackDebugEntry(title, detail);
+  });
+
+  window.addEventListener("anytogether:playback-telemetry", (event) => {
+    const detail = event.detail || {};
+    const roomId = normalizeRoomCode(detail.roomId);
+    if (!roomId || roomId !== state.activeRoomId || detail.clientId !== clientId) {
+      return;
+    }
+    participantPlaybackStates.set(clientId, detail.playbackState || "paused");
+    participantSyncStates.set(clientId, {
+      buffering: detail.buffering === true,
+      offsetMs: Number.isFinite(detail.offsetMs) ? Math.max(0, detail.offsetMs) : 0,
+      updatedAt: Date.now(),
+      version: Number.isInteger(detail.version) ? detail.version : null
+    });
+    if (state.ws?.readyState === WebSocket.OPEN) {
+      state.ws.send(JSON.stringify({
+        type: "room:playback-status",
+        roomId,
+        buffering: detail.buffering === true,
+        offsetMs: Number.isFinite(detail.offsetMs) ? Math.max(0, Math.round(detail.offsetMs)) : 0,
+        playbackState: detail.playbackState || "paused",
+        version: Number.isInteger(detail.version) ? detail.version : null
+      }));
+    }
   });
 
   window.addEventListener("message", (event) => {

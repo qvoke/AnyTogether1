@@ -3,6 +3,9 @@ import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 
 const config = JSON.parse(readFileSync(new URL("../e2e.config.json", import.meta.url), "utf8"));
+const maxClientDeltaMs = Math.max(40, Number(config.maxClientDeltaMs) || 200);
+const maxSeekConvergenceMs = Math.max(1_000, Number(config.maxSeekConvergenceMs) || 7_000);
+const maxSeekLoadingMs = Math.max(1_000, Number(config.maxSeekLoadingMs) || 6_000);
 
 function sitesRequestHeaders() {
   const token = process.env.E2E_SITES_BYPASS_TOKEN;
@@ -88,6 +91,14 @@ async function playbackSamples(pages, operationStartedAt = 0) {
   }, operationStartedAt)));
 }
 
+async function synchronizedSeekEventCounts(pages, operationStartedAt) {
+  return Promise.all(pages.map((page) => page.evaluate((startedAt) => (
+    (window.__getPlaybackEvents?.() || []).filter((entry) => (
+      entry.type === "sync-seek" && entry.at >= startedAt
+    )).length
+  ), operationStartedAt)));
+}
+
 function isPlaybackSampleStable(sample) {
   const remainingSec = Number.isFinite(sample.duration)
     ? Math.max(0, sample.duration - sample.currentTime)
@@ -130,7 +141,7 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
         throw new Error("Fatal HLS error occurred while waiting for playback");
       }
       const stablePlayback = samples.every(isPlaybackSampleStable);
-      const clientsConverged = Math.abs(samples[0].currentTime - samples[1].currentTime) < 0.75;
+      const clientsConverged = Math.abs(samples[0].currentTime - samples[1].currentTime) * 1_000 < maxClientDeltaMs;
       let authoritativeConvergence = true;
       if (expectedPosition !== undefined) {
         const authoritative = await pipelineState(pageA);
@@ -199,19 +210,28 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
   const stablePlayback = settleEndSamples.every((sample) => (
     isPlaybackSampleStable(sample) && sample.fatalHlsErrors === 0
   ));
-  const clientsConverged = Math.abs(settleEndSamples[0].currentTime - settleEndSamples[1].currentTime) < 0.75;
+  const clientDeltaMs = Math.round(Math.abs(settleEndSamples[0].currentTime - settleEndSamples[1].currentTime) * 1_000);
+  const clientsConverged = clientDeltaMs < maxClientDeltaMs;
   const hangDetected = progressDeltaSec.some((progress) => progress < minimumProgressSec);
   const unstablePlaybackDetected = !stablePlayback;
   const desynchronizationDetected = !clientsConverged;
   const fatalHlsErrorCount = settleEndSamples.reduce((total, sample) => total + sample.fatalHlsErrors, 0);
+  const convergenceWaitMs = Date.now() - synchronizationStartedAt - settleMs;
+  const syncSeekEventCounts = expectedPosition === undefined
+    ? []
+    : await synchronizedSeekEventCounts([pageA, pageB], operationStartedAt);
+  const repeatedSyncSeekDetected = syncSeekEventCounts.some((count) => count > 1);
+  const loadingTooSlow = expectedPosition !== undefined && (loadingWaitMs === null || loadingWaitMs > maxSeekLoadingMs);
+  const convergenceTooSlow = expectedPosition !== undefined && convergenceWaitMs > maxSeekConvergenceMs;
 
   if (syncLog) {
     const playbackFailed = fatalHlsErrorDuringSettle || fatalHlsErrorCount > 0 ||
-      hangDetected || unstablePlaybackDetected || desynchronizationDetected;
+      hangDetected || unstablePlaybackDetected || desynchronizationDetected || repeatedSyncSeekDetected ||
+      loadingTooSlow || convergenceTooSlow;
     syncLog.push({
       targetPosition: expectedPosition ?? null,
       loadingWaitMs,
-      convergenceWaitMs: Date.now() - synchronizationStartedAt - settleMs,
+      convergenceWaitMs,
       settledAfterMs: settleMs,
       totalWaitMs: Date.now() - synchronizationStartedAt,
       samples: settleEndSamples.map(({ currentTime, forwardBufferSec, paused, readyState, seeking }) => ({
@@ -221,12 +241,16 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
         readyState,
         seeking
       })),
-      deltaMs: Math.round(Math.abs(settleEndSamples[0].currentTime - settleEndSamples[1].currentTime) * 1_000),
+      deltaMs: clientDeltaMs,
       progressDeltaSec,
       fatalHlsErrorCount,
       hangDetected,
       unstablePlaybackDetected,
       desynchronizationDetected,
+      repeatedSyncSeekDetected,
+      syncSeekEventCounts,
+      loadingTooSlow,
+      convergenceTooSlow,
       ...(playbackFailed
         ? { failureDiagnostics: await playbackFailureDiagnostics([pageA, pageB]) }
         : {})
@@ -246,6 +270,15 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
   }
   if (desynchronizationDetected) {
     throw new Error("Playback clients diverged during the stability window");
+  }
+  if (repeatedSyncSeekDetected) {
+    throw new Error("A synchronized seek triggered more than one media seek");
+  }
+  if (loadingTooSlow) {
+    throw new Error(`Seek loading exceeded ${maxSeekLoadingMs} ms`);
+  }
+  if (convergenceTooSlow) {
+    throw new Error(`Seek convergence exceeded ${maxSeekConvergenceMs} ms`);
   }
 }
 
@@ -267,7 +300,7 @@ test("two isolated browser contexts join the same synchronized room", async ({ b
 });
 
 test("media, play, seek, and pause propagate between browser contexts", async ({ browser, request }, testInfo) => {
-  test.setTimeout(180_000);
+  test.setTimeout(300_000);
   const mediaUrl = process.env.E2E_MEDIA_URL || config.mediaUrl;
   test.skip(!mediaUrl, "Set E2E_MEDIA_URL or tests/e2e.config.json mediaUrl to a public CORS-enabled MP4 or HLS VOD URL.");
   test.skip(config.run !== true || Number(config.participants) !== 2, "The E2E command config disables the two-participant scenario.");
@@ -319,6 +352,10 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   await second.page.waitForTimeout(3_200);
   const blockedPositionAfterReconciliation = await second.page.locator("#player").evaluate((video) => video.currentTime);
   expect(Math.abs(blockedPositionAfterReconciliation - blockedPosition)).toBeLessThan(0.25);
+  const secondClientId = await second.page.evaluate(() => window.__anyTogetherClientId);
+  await expect.poll(() => first.page.evaluate((participantClientId) => (
+    window.__getParticipantSyncTelemetry?.(participantClientId)?.offsetMs ?? 0
+  ), secondClientId)).toBeGreaterThan(1_000);
   await togglePlayback(second.page);
   await expect.poll(async () => (await pipelineState(second.page))?.activationNeeded).toBe(false);
   await expect.poll(() => second.page.locator("#player").evaluate((video) => video.paused)).toBe(false);

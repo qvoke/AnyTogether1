@@ -376,6 +376,8 @@ export class RoomDurableObject implements DurableObject {
 
     if (message.type === "room:profile") {
       await this.updateProfile(socket, attachment, message);
+    } else if (message.type === "room:playback-status") {
+      this.broadcastPlaybackStatus(socket, attachment, message);
     } else if (message.type === "room:media-request") {
       this.forwardMediaRequest(socket, attachment, message);
     } else if (message.type === "room:participant-action") {
@@ -395,6 +397,34 @@ export class RoomDurableObject implements DurableObject {
     } else if (message.type === "media:set") {
       await this.setUiMedia(socket, message);
     }
+  }
+
+  private broadcastPlaybackStatus(
+    socket: WebSocket,
+    attachment: UiSocketAttachment,
+    message: Record<string, unknown>,
+  ): void {
+    const offsetMs = Number(message.offsetMs);
+    const playbackState = message.playbackState;
+    const version = Number(message.version);
+    if (
+      !attachment.clientId ||
+      !Number.isFinite(offsetMs) ||
+      offsetMs < 0 ||
+      !["loading", "paused", "playing"].includes(String(playbackState))
+    ) {
+      this.send(socket, { type: "room:error", roomId: this.room?.code, message: "Invalid playback status." });
+      return;
+    }
+    this.broadcastUi({
+      type: "room:playback-status",
+      roomId: this.room?.code,
+      buffering: message.buffering === true,
+      clientId: attachment.clientId,
+      offsetMs: Math.min(60_000, Math.round(offsetMs)),
+      playbackState,
+      version: Number.isInteger(version) && version >= 0 ? version : null,
+    });
   }
 
   private async joinRoom(

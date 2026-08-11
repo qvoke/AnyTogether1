@@ -23,26 +23,13 @@ export function getPlaybackToggleIntent(roomState, localPaused) {
   return roomState.playback.paused ? "play" : "pause";
 }
 
-export function getBufferedCorrectionPosition(
-  ranges,
-  positionSec,
-  marginSec = 0.05,
-  minimumAheadSec = 2
-) {
-  if (!Number.isFinite(positionSec)) {
-    return null;
+export function getHlsSyncPlaybackRate(errorSec) {
+  const absoluteError = Math.abs(errorSec);
+  if (!Number.isFinite(absoluteError) || absoluteError <= 0.04) {
+    return 1;
   }
-  for (const range of ranges) {
-    if (
-      Number.isFinite(range.start) &&
-      Number.isFinite(range.end) &&
-      positionSec >= range.start - marginSec &&
-      positionSec <= range.end - Math.max(marginSec, minimumAheadSec)
-    ) {
-      return Math.max(positionSec, range.start + marginSec);
-    }
-  }
-  return null;
+  const adjustment = absoluteError >= 1 ? 1 : absoluteError >= 0.5 ? 0.5 : absoluteError >= 0.2 ? 0.3 : 0.15;
+  return errorSec > 0 ? 1 + adjustment : Math.max(0.5, 1 - adjustment);
 }
 
 export function shouldDeferHlsCorrection(roomState, correction, playerState) {
