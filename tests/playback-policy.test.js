@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   getPlaybackToggleIntent,
   getRelativeSeekPosition,
-  isPositionBuffered,
   shouldDeferHlsCorrection
 } from "../public/playback-policy.js";
 
@@ -40,27 +39,40 @@ test("a locally blocked participant activates playback without pausing the room"
   assert.equal(getPlaybackToggleIntent({ media: null, playback: { paused: true } }, true), null);
 });
 
-test("HLS correction waits until the advancing room position is buffered", () => {
+test("HLS correction waits for stable playback after a remote seek", () => {
   const roomState = {
     media: { id: "media-1", kind: "hls" },
     playback: { paused: false },
     version: 7
   };
-  const ranges = [[457, 463]];
-  const buffered = {
-    length: ranges.length,
-    start: (index) => ranges[index][0],
-    end: (index) => ranges[index][1]
-  };
-  const player = { buffered };
-  const remoteSeek = { positionSec: 457, version: 7 };
+  const correction = { awaitingPlayback: true, version: 7 };
 
-  assert.equal(isPositionBuffered(buffered, 460), true);
-  assert.equal(isPositionBuffered(buffered, 466), false);
-  assert.equal(shouldDeferHlsCorrection(roomState, player, remoteSeek, 466), true);
-  assert.equal(shouldDeferHlsCorrection(roomState, player, remoteSeek, 460), false);
   assert.equal(
-    shouldDeferHlsCorrection({ ...roomState, version: 8 }, player, remoteSeek, 466),
+    shouldDeferHlsCorrection(roomState, correction, { buffering: false, seeking: false }),
+    true
+  );
+  assert.equal(
+    shouldDeferHlsCorrection(
+      roomState,
+      { ...correction, awaitingPlayback: false },
+      { buffering: true, seeking: false }
+    ),
+    true
+  );
+  assert.equal(
+    shouldDeferHlsCorrection(
+      roomState,
+      { ...correction, awaitingPlayback: false },
+      { buffering: false, seeking: false }
+    ),
+    false
+  );
+  assert.equal(
+    shouldDeferHlsCorrection(
+      { ...roomState, version: 8 },
+      correction,
+      { buffering: true, seeking: true }
+    ),
     false
   );
 });

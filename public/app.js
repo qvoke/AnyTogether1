@@ -29,13 +29,14 @@ const state = {
   connection: null,
   connectionGeneration: 0,
   hls: null,
+  hlsBuffering: false,
+  hlsCorrection: null,
   lastHlsRecoveryAt: 0,
   lastHlsLoadVersion: null,
   lastSyncErrorMs: 0,
   playbackBlocked: false,
   reconnectTimer: null,
   remotePlayUntil: 0,
-  remoteSeek: null,
   pendingSeek: null,
   resetRateTimer: null,
   roomId: null,
@@ -363,7 +364,10 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
     const requiresHardCorrection = absoluteError > HARD_SYNC_THRESHOLD_SEC || player.paused;
     if (
       requiresHardCorrection &&
-      shouldDeferHlsCorrection(roomState, player, state.remoteSeek, expectedPosition)
+      shouldDeferHlsCorrection(roomState, state.hlsCorrection, {
+        buffering: state.hlsBuffering,
+        seeking: player.seeking
+      })
     ) {
       player.playbackRate = 1;
       storeDiagnostic({
@@ -423,8 +427,8 @@ function requestAuthoritativePlayback(player) {
 }
 
 function setRemotePosition(player, positionSec, roomState) {
-  state.remoteSeek = roomState.media?.kind === "hls"
-    ? { positionSec, version: roomState.version }
+  state.hlsCorrection = roomState.media?.kind === "hls"
+    ? { awaitingPlayback: !roomState.playback.paused, version: roomState.version }
     : null;
   player.currentTime = positionSec;
 }
@@ -433,9 +437,10 @@ function unloadSource() {
   const player = elements.player;
   state.hls?.destroy();
   state.hls = null;
+  state.hlsBuffering = false;
+  state.hlsCorrection = null;
   state.lastHlsRecoveryAt = 0;
   state.lastHlsLoadVersion = null;
-  state.remoteSeek = null;
   state.sourceId = null;
   if (!player) {
     return;
@@ -564,11 +569,16 @@ function bindPlayerEvents() {
   player.addEventListener("loadedmetadata", () => synchronizePlayer("metadata"));
   player.addEventListener("canplay", () => synchronizePlayer("canplay"));
   player.addEventListener("waiting", () => {
+    state.hlsBuffering = state.roomState?.media?.kind === "hls";
     state.remotePlayUntil = performance.now() + 60_000;
     recordPlaybackEvent("waiting", player);
     logSyncEvent("Buffering media at the shared position.");
   });
   player.addEventListener("playing", () => {
+    state.hlsBuffering = false;
+    if (state.hlsCorrection?.version === state.roomState?.version && !player.seeking) {
+      state.hlsCorrection.awaitingPlayback = false;
+    }
     setPlaybackBlocked(false);
     state.remotePlayUntil = 0;
     recordPlaybackEvent("playing", player);
