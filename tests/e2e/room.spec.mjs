@@ -65,13 +65,17 @@ async function waitForMedia(page, mediaUrl) {
   }, { timeout: 30_000 }).toBe(true);
 }
 
-async function playbackSamples(pages) {
-  return Promise.all(pages.map((page) => page.locator("#player").evaluate((video) => ({
+async function playbackSamples(pages, operationStartedAt = 0) {
+  return Promise.all(pages.map((page) => page.locator("#player").evaluate((video, startedAt) => ({
     currentTime: video.currentTime,
     paused: video.paused,
     ended: video.ended,
-    readyState: video.readyState
-  }))));
+    readyState: video.readyState,
+    seeking: video.seeking,
+    fatalHlsErrors: (window.__getSyncDiagnostics?.() || []).filter((entry) => (
+      entry.type === "hls-error" && entry.fatal === true && entry.at >= startedAt
+    )).length
+  }), operationStartedAt)));
 }
 
 async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncLog = null, persistSyncLog = null, operationStartedAt = Date.now()) {
@@ -79,27 +83,37 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
   let loadingWaitMs = null;
   const synchronizationStartedAt = Date.now();
   const convergenceTimeoutMs = 30_000;
+  let converged = false;
   try {
-    await expect.poll(async () => {
-      const samples = await playbackSamples([pageA, pageB]);
+    while (Date.now() - synchronizationStartedAt < convergenceTimeoutMs) {
+      const samples = await playbackSamples([pageA, pageB], operationStartedAt);
       finalSamples = samples;
       if (loadingWaitMs === null && samples.every((sample) => sample.readyState >= 3)) {
         loadingWaitMs = Date.now() - operationStartedAt;
       }
-      if (samples.some((sample) => sample.readyState < 1)) {
-        return false;
+      if (samples.some((sample) => sample.fatalHlsErrors > 0)) {
+        throw new Error("Fatal HLS error occurred while waiting for playback");
       }
-      if (Math.abs(samples[0].currentTime - samples[1].currentTime) >= 0.75) {
-        return false;
+      const stablePlayback = samples.every((sample) => (
+        sample.readyState >= 3 && !sample.paused && !sample.seeking && !sample.ended
+      ));
+      const clientsConverged = Math.abs(samples[0].currentTime - samples[1].currentTime) < 0.75;
+      let authoritativeConvergence = true;
+      if (expectedPosition !== undefined) {
+        const authoritative = await pipelineState(pageA);
+        const expectedPositionAtSample = authoritative?.positionSec;
+        authoritativeConvergence = Number.isFinite(expectedPositionAtSample) &&
+          samples.every((sample) => Math.abs(sample.currentTime - expectedPositionAtSample) < 1.5);
       }
-      if (expectedPosition === undefined) {
-        return true;
+      if (stablePlayback && clientsConverged && authoritativeConvergence) {
+        converged = true;
+        break;
       }
-      const authoritative = await pipelineState(pageA);
-      const expectedPositionAtSample = authoritative?.positionSec;
-      return Number.isFinite(expectedPositionAtSample) &&
-        samples.every((sample) => Math.abs(sample.currentTime - expectedPositionAtSample) < 1.5);
-    }, { intervals: [100, 250, 500, 1_000], timeout: convergenceTimeoutMs }).toBe(true);
+      await pageA.waitForTimeout(100);
+    }
+    if (!converged) {
+      throw new Error(`Playback convergence exceeded ${convergenceTimeoutMs} ms`);
+    }
   } catch (error) {
     if (syncLog) {
       syncLog.push({
@@ -113,22 +127,28 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
           ? Math.round(Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000)
           : null,
         progressDeltaSec: [],
-        hangDetected: false,
-        convergenceTimedOut: true,
+        fatalHlsErrorCount: finalSamples.reduce((total, sample) => total + sample.fatalHlsErrors, 0),
+        hangDetected: true,
+        convergenceTimedOut: Date.now() - synchronizationStartedAt >= convergenceTimeoutMs,
         timeoutMs: convergenceTimeoutMs
       });
       if (persistSyncLog) {
         await persistSyncLog();
       }
     }
-    throw new Error(`Playback convergence exceeded ${convergenceTimeoutMs} ms`, { cause: error });
+    throw new Error("Playback did not reach a stable synchronized state", { cause: error });
   }
 
   const settleMs = Math.max(0, Number(config.playbackSettleMs) || 0);
-  const settleStartSamples = await playbackSamples([pageA, pageB]);
+  const settleStartSamples = await playbackSamples([pageA, pageB], operationStartedAt);
   const settleStartedAt = Date.now();
+  let fatalHlsErrorDuringSettle = false;
   while (Date.now() - settleStartedAt < settleMs) {
-    const samples = await playbackSamples([pageA, pageB]);
+    const samples = await playbackSamples([pageA, pageB], operationStartedAt);
+    if (samples.some((sample) => sample.fatalHlsErrors > 0)) {
+      fatalHlsErrorDuringSettle = true;
+      break;
+    }
     if (loadingWaitMs === null && samples.every((sample) => sample.readyState >= 3)) {
       loadingWaitMs = Date.now() - operationStartedAt;
     }
@@ -137,10 +157,19 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
       await pageA.waitForTimeout(Math.min(100, remainingSettleMs));
     }
   }
-  const settleEndSamples = await playbackSamples([pageA, pageB]);
+  const settleEndSamples = await playbackSamples([pageA, pageB], operationStartedAt);
   const progressDeltaSec = settleEndSamples.map((sample, index) => (
     sample.currentTime - settleStartSamples[index].currentTime
   ));
+  const minimumProgressSec = settleMs > 0 ? Math.min(0.75, settleMs / 2_000) : 0;
+  const stablePlayback = settleEndSamples.every((sample) => (
+    sample.readyState >= 3 && !sample.paused && !sample.seeking && !sample.ended && sample.fatalHlsErrors === 0
+  ));
+  const clientsConverged = Math.abs(settleEndSamples[0].currentTime - settleEndSamples[1].currentTime) < 0.75;
+  const hangDetected = progressDeltaSec.some((progress) => progress < minimumProgressSec);
+  const unstablePlaybackDetected = !stablePlayback;
+  const desynchronizationDetected = !clientsConverged;
+  const fatalHlsErrorCount = settleEndSamples.reduce((total, sample) => total + sample.fatalHlsErrors, 0);
 
   if (syncLog) {
     syncLog.push({
@@ -149,14 +178,34 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
       convergenceWaitMs: Date.now() - synchronizationStartedAt - settleMs,
       settledAfterMs: settleMs,
       totalWaitMs: Date.now() - synchronizationStartedAt,
-      samples: finalSamples.map(({ currentTime, readyState }) => ({ currentTime, readyState })),
-      deltaMs: Math.round(Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000),
+      samples: settleEndSamples.map(({ currentTime, paused, readyState, seeking }) => ({
+        currentTime,
+        paused,
+        readyState,
+        seeking
+      })),
+      deltaMs: Math.round(Math.abs(settleEndSamples[0].currentTime - settleEndSamples[1].currentTime) * 1_000),
       progressDeltaSec,
-      hangDetected: false
+      fatalHlsErrorCount,
+      hangDetected,
+      unstablePlaybackDetected,
+      desynchronizationDetected
     });
     if (persistSyncLog) {
       await persistSyncLog();
     }
+  }
+  if (fatalHlsErrorDuringSettle || fatalHlsErrorCount > 0) {
+    throw new Error("Fatal HLS error occurred during the playback stability window");
+  }
+  if (hangDetected) {
+    throw new Error("Playback stopped progressing during the stability window");
+  }
+  if (unstablePlaybackDetected) {
+    throw new Error("Playback did not remain ready and playing during the stability window");
+  }
+  if (desynchronizationDetected) {
+    throw new Error("Playback clients diverged during the stability window");
   }
 }
 

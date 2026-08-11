@@ -1,12 +1,14 @@
 const REPORT_STORAGE_KEY = "anytogether:manual-diagnostics";
-const SNAPSHOT_INTERVAL_MS = 1_000;
+const SAMPLE_INTERVAL_MS = 1_000;
 const MAX_ITEMS = 1_000;
-const REPORT_VERSION = 1;
+const REPORT_VERSION = 2;
+const OMITTED_DIAGNOSTIC_TYPES = new Set(["clock", "delivery", "sync"]);
 
 if (import.meta.env.DEV) {
   let report = loadReport() || createReport();
-  let syncDiagnosticKeys = createItemKeys(report.syncDiagnostics);
+  let diagnosticKeys = createItemKeys(report.diagnostics);
   let playbackEventKeys = createItemKeys(report.playbackEvents);
+  let bufferedRangesKey = findLastBufferedRangesKey();
   let statusElement = null;
 
   function redactUrl(value) {
@@ -41,10 +43,14 @@ if (import.meta.env.DEV) {
         origin: window.location.origin,
         userAgent: navigator.userAgent
       },
+      context: {
+        roomId: null,
+        media: null
+      },
       lifecycle: [],
       messages: [],
-      snapshots: [],
-      syncDiagnostics: [],
+      samples: [],
+      diagnostics: [],
       playbackEvents: [],
       errors: []
     };
@@ -53,13 +59,23 @@ if (import.meta.env.DEV) {
   function loadReport() {
     try {
       const stored = JSON.parse(sessionStorage.getItem(REPORT_STORAGE_KEY) || "null");
-      if (stored?.version !== REPORT_VERSION || !Array.isArray(stored.snapshots)) {
+      if (stored?.version !== REPORT_VERSION || !Array.isArray(stored.samples)) {
         return null;
       }
       return stored;
     } catch {
       return null;
     }
+  }
+
+  function findLastBufferedRangesKey() {
+    for (let index = report.samples.length - 1; index >= 0; index -= 1) {
+      const ranges = report.samples[index].bufferedRanges;
+      if (ranges) {
+        return JSON.stringify(ranges);
+      }
+    }
+    return "";
   }
 
   function itemKey(item) {
@@ -69,7 +85,9 @@ if (import.meta.env.DEV) {
       item?.title,
       item?.reason,
       item?.version,
-      item?.currentTime
+      item?.currentTime,
+      item?.details,
+      item?.fatal
     ]);
   }
 
@@ -84,8 +102,12 @@ if (import.meta.env.DEV) {
     }
   }
 
-  function mergeUnique(target, items, keys) {
+  function mergeUnique(target, items, keys, predicate) {
+    const startedAtMs = Date.parse(report.startedAt);
     for (const item of Array.isArray(items) ? items : []) {
+      if (!Number.isFinite(item?.at) || item.at < startedAtMs || !predicate(item)) {
+        continue;
+      }
       const key = itemKey(item);
       if (keys.has(key)) {
         continue;
@@ -99,8 +121,8 @@ if (import.meta.env.DEV) {
     try {
       sessionStorage.setItem(REPORT_STORAGE_KEY, JSON.stringify(report));
     } catch {
-      report.snapshots.splice(0, Math.ceil(report.snapshots.length / 2));
-      report.syncDiagnostics.splice(0, Math.ceil(report.syncDiagnostics.length / 2));
+      report.samples.splice(0, Math.ceil(report.samples.length / 2));
+      report.diagnostics.splice(0, Math.ceil(report.diagnostics.length / 2));
       report.playbackEvents.splice(0, Math.ceil(report.playbackEvents.length / 2));
       try {
         sessionStorage.setItem(REPORT_STORAGE_KEY, JSON.stringify(report));
@@ -108,27 +130,69 @@ if (import.meta.env.DEV) {
     }
   }
 
-  function collectSnapshot(reason = "interval") {
+  function finiteRounded(value, digits = 3) {
+    return Number.isFinite(value) ? Number(value.toFixed(digits)) : null;
+  }
+
+  function collectSample(reason = "interval") {
     const pipeline = window.__getPlaybackPipelineState?.() ?? null;
     const interfaceState = window.__getInterfaceMediaState?.() ?? null;
-    append(report.snapshots, {
-      at: new Date().toISOString(),
-      reason,
-      pipeline,
-      interfaceState
-    });
-    mergeUnique(report.syncDiagnostics, window.__getSyncDiagnostics?.(), syncDiagnosticKeys);
-    mergeUnique(report.playbackEvents, window.__getPlaybackEvents?.(), playbackEventKeys);
+    if (pipeline) {
+      const ranges = (pipeline.bufferedRanges || []).map((range) => ({
+        start: finiteRounded(range.start),
+        end: finiteRounded(range.end)
+      }));
+      const nextBufferedRangesKey = JSON.stringify(ranges);
+      const sample = {
+        at: Date.now(),
+        reason,
+        version: pipeline.version,
+        roomPositionSec: finiteRounded(pipeline.positionSec),
+        localPositionSec: finiteRounded(pipeline.localPositionSec),
+        syncErrorMs: pipeline.syncErrorMs,
+        readyState: pipeline.readyState,
+        networkState: pipeline.networkState,
+        authoritativePaused: pipeline.paused,
+        localPaused: pipeline.localPaused,
+        seeking: pipeline.seeking,
+        hlsBuffering: pipeline.hlsBuffering,
+        correctionVersion: pipeline.hlsCorrection?.version ?? null,
+        awaitingPlayback: pipeline.hlsCorrection?.awaitingPlayback ?? false,
+        currentLevel: pipeline.hlsCurrentLevel,
+        loadLevel: pipeline.hlsLoadLevel,
+        nextLoadLevel: pipeline.hlsNextLoadLevel,
+        bandwidthEstimate: pipeline.hlsBandwidthEstimate,
+        roundTripMs: pipeline.roundTripMs,
+        clockOffsetMs: pipeline.clockOffsetMs
+      };
+      if (nextBufferedRangesKey !== bufferedRangesKey) {
+        sample.bufferedRanges = ranges;
+        bufferedRangesKey = nextBufferedRangesKey;
+      }
+      append(report.samples, sample);
+      report.context.roomId = pipeline.roomId || report.context.roomId;
+    }
+    if (interfaceState) {
+      report.context.media = redact(interfaceState);
+    }
+    mergeUnique(
+      report.diagnostics,
+      window.__getSyncDiagnostics?.(),
+      diagnosticKeys,
+      (item) => !OMITTED_DIAGNOSTIC_TYPES.has(item.type)
+    );
+    mergeUnique(report.playbackEvents, window.__getPlaybackEvents?.(), playbackEventKeys, () => true);
     persistReport();
     updateStatus();
   }
 
   function resetReport(reason) {
     report = createReport();
-    syncDiagnosticKeys = new Set();
+    diagnosticKeys = new Set();
     playbackEventKeys = new Set();
+    bufferedRangesKey = "";
     append(report.lifecycle, { at: new Date().toISOString(), type: reason });
-    collectSnapshot("reset");
+    collectSample("reset");
   }
 
   function reportFilename() {
@@ -138,7 +202,7 @@ if (import.meta.env.DEV) {
   }
 
   function downloadReport() {
-    collectSnapshot("download");
+    collectSample("download");
     const payload = JSON.stringify({ ...report, downloadedAt: new Date().toISOString() }, null, 2);
     const url = URL.createObjectURL(new Blob([`${payload}\n`], { type: "application/json" }));
     const anchor = document.createElement("a");
@@ -154,7 +218,7 @@ if (import.meta.env.DEV) {
       return;
     }
     const elapsedSec = Math.max(0, Math.round((Date.now() - Date.parse(report.startedAt)) / 1_000));
-    statusElement.textContent = `${elapsedSec}s · ${report.syncDiagnostics.length} sync · ${report.playbackEvents.length} media`;
+    statusElement.textContent = `${elapsedSec}s · ${report.diagnostics.length} events · ${report.playbackEvents.length} media`;
   }
 
   function createButton(label, action) {
@@ -228,16 +292,16 @@ if (import.meta.env.DEV) {
       downloadReport();
     }
   });
-  window.addEventListener("pagehide", () => collectSnapshot("pagehide"));
+  window.addEventListener("pagehide", () => collectSample("pagehide"));
   const diagnosticsApi = {
     download: downloadReport,
     getReport: () => redact(report),
     reset: () => resetReport("api-reset"),
-    snapshot: () => collectSnapshot("manual")
+    snapshot: () => collectSample("manual")
   };
   Object.defineProperty(diagnosticsApi, "runId", { get: () => report.runId });
   window.__anyTogetherDiagnostics = diagnosticsApi;
   installToolbar();
-  collectSnapshot("start");
-  window.setInterval(() => collectSnapshot("interval"), SNAPSHOT_INTERVAL_MS);
+  collectSample("start");
+  window.setInterval(() => collectSample("interval"), SAMPLE_INTERVAL_MS);
 }

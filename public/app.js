@@ -39,6 +39,7 @@ const state = {
   remotePlayUntil: 0,
   pendingSeek: null,
   resetRateTimer: null,
+  roundTripMs: null,
   roomId: null,
   roomState: null,
   sourceId: null,
@@ -80,8 +81,17 @@ function redactDiagnostic(value) {
     if (typeof item !== "string") {
       return item;
     }
-    return item.replace(/https:\/\/[^\s"']+/gi, "[redacted-url]");
+    return item.replace(/https:\/\/[^\s"']+/gi, sanitizeDiagnosticUrl);
   }));
+}
+
+function sanitizeDiagnosticUrl(value) {
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}${url.search ? "?[redacted]" : ""}`;
+  } catch {
+    return "[redacted-url]";
+  }
 }
 
 function recordPlaybackEvent(type, player) {
@@ -501,13 +511,48 @@ function loadSource(media) {
 }
 
 function handleHlsError(hls, data) {
+  const fragment = data.frag;
   storeDiagnostic({
     type: "hls-error",
     details: data.details,
     fatal: data.fatal,
     errorType: data.type,
+    fragment: fragment
+      ? {
+          duration: fragment.duration,
+          level: fragment.level,
+          sequenceNumber: fragment.sn,
+          start: fragment.start,
+          url: fragment.url
+        }
+      : null,
+    hlsState: {
+      autoLevelEnabled: hls.autoLevelEnabled,
+      bandwidthEstimate: hls.bandwidthEstimate,
+      currentLevel: hls.currentLevel,
+      loadLevel: hls.loadLevel,
+      nextLoadLevel: hls.nextLoadLevel
+    },
+    recovery: data.errorAction
+      ? {
+          action: data.errorAction.action,
+          flags: data.errorAction.flags,
+          nextAutoLevel: data.errorAction.nextAutoLevel,
+          resolved: data.errorAction.resolved,
+          retryCount: data.errorAction.retryCount
+        }
+      : null,
     response: data.response
       ? { code: data.response.code, text: data.response.text, url: data.response.url }
+      : null,
+    stats: data.stats
+      ? {
+          aborted: data.stats.aborted,
+          bandwidthEstimate: data.stats.bwEstimate,
+          loaded: data.stats.loaded,
+          retry: data.stats.retry,
+          total: data.stats.total
+        }
       : null,
     url: data.url || null
   });
@@ -708,9 +753,14 @@ window.__getPlaybackPipelineState = () => ({
     : [],
   connected: isSocketOpen(),
   hlsActive: Boolean(state.hls),
+  hlsBandwidthEstimate: state.hls?.bandwidthEstimate ?? null,
   hlsBuffering: state.hlsBuffering,
   hlsCorrection: state.hlsCorrection ? { ...state.hlsCorrection } : null,
+  hlsCurrentLevel: state.hls?.currentLevel ?? null,
+  hlsLoadLevel: state.hls?.loadLevel ?? null,
+  hlsNextLoadLevel: state.hls?.nextLoadLevel ?? null,
   localPositionSec: elements.player?.currentTime ?? null,
+  localPaused: elements.player?.paused ?? true,
   mediaUrl: state.roomState?.media?.url || "",
   networkState: elements.player?.networkState ?? null,
   paused: state.roomState?.playback?.paused ?? true,
@@ -718,8 +768,10 @@ window.__getPlaybackPipelineState = () => ({
   ready: Boolean(elements.player && elements.player.readyState >= HTMLMediaElement.HAVE_METADATA),
   readyState: elements.player?.readyState ?? null,
   roomId: state.roomId,
+  roundTripMs: state.roundTripMs,
   seeking: elements.player?.seeking ?? false,
   syncErrorMs: state.lastSyncErrorMs,
+  clockOffsetMs: state.clockOffsetMs,
   version: state.roomState?.version ?? null
 });
 window.__getPlaybackEvents = () => state.playbackEvents.slice();
