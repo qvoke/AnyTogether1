@@ -3,7 +3,6 @@ import { resolve } from "node:path";
 import { defineConfig } from "vite";
 import hostingConfig from "./.openai/hosting.json";
 import { sites } from "./sites-vite-plugin";
-import { diagnostics } from "./vite-diagnostics-plugin";
 
 const LOCAL_DATABASE_ID = "00000000-0000-4000-8000-000000000000";
 
@@ -26,7 +25,6 @@ export default defineConfig({
     },
   },
   plugins: [
-    diagnostics(),
     sites(),
     cloudflare({
       persistState: { path: process.env.CLOUDFLARE_STATE_PATH || ".notes/build-codex/cloudflare-state" },

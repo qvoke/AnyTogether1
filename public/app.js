@@ -700,13 +700,26 @@ window.__getPlaybackSyncInfo = (participantClientId = state.clientId) => {
 };
 window.__getPlaybackPipelineState = () => ({
   activationNeeded: state.playbackBlocked,
+  bufferedRanges: elements.player
+    ? Array.from({ length: elements.player.buffered.length }, (_item, index) => ({
+        end: elements.player.buffered.end(index),
+        start: elements.player.buffered.start(index)
+      }))
+    : [],
   connected: isSocketOpen(),
   hlsActive: Boolean(state.hls),
+  hlsBuffering: state.hlsBuffering,
+  hlsCorrection: state.hlsCorrection ? { ...state.hlsCorrection } : null,
+  localPositionSec: elements.player?.currentTime ?? null,
   mediaUrl: state.roomState?.media?.url || "",
+  networkState: elements.player?.networkState ?? null,
   paused: state.roomState?.playback?.paused ?? true,
   positionSec: state.roomState ? getPositionAt(state.roomState, estimateServerNow()) : null,
   ready: Boolean(elements.player && elements.player.readyState >= HTMLMediaElement.HAVE_METADATA),
+  readyState: elements.player?.readyState ?? null,
   roomId: state.roomId,
+  seeking: elements.player?.seeking ?? false,
+  syncErrorMs: state.lastSyncErrorMs,
   version: state.roomState?.version ?? null
 });
 window.__getPlaybackEvents = () => state.playbackEvents.slice();

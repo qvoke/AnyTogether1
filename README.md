@@ -177,4 +177,7 @@ const streamPattern = /\.(?:m3u8|mp4)(?:\?|$)/i;
 
 The interface keeps playback diagnostics visible in the room log. Up to 300
 redacted diagnostic records are retained in local storage and up to 500 media
-events remain available through the test bridge.
+events remain available through the test bridge. During local development, the
+diagnostic toolbar records one browser session without writing server-side
+files. `Download + new log` or `Ctrl+Shift+L` downloads a redacted JSON report
+and starts a clean session. Reloading the page preserves the active session.
