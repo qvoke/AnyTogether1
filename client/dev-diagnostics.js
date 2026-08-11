@@ -1,8 +1,35 @@
 const REPORT_STORAGE_KEY = "anytogether:manual-diagnostics";
 const SAMPLE_INTERVAL_MS = 1_000;
 const MAX_ITEMS = 1_000;
-const REPORT_VERSION = 2;
+const REPORT_VERSION = 3;
 const OMITTED_DIAGNOSTIC_TYPES = new Set(["clock", "delivery", "sync"]);
+const SAMPLE_FIELDS = [
+  "elapsedMs",
+  "version",
+  "roomPositionMs",
+  "localPositionMs",
+  "syncErrorMs",
+  "readyState",
+  "networkState",
+  "flags",
+  "correctionVersion",
+  "currentLevel",
+  "loadLevel",
+  "nextLoadLevel",
+  "bandwidthKbps",
+  "roundTripMs",
+  "clockOffsetMs"
+];
+const SAMPLE_FLAGS = {
+  authoritativePaused: 1,
+  localPaused: 2,
+  seeking: 4,
+  hlsBuffering: 8,
+  awaitingPlayback: 16
+};
+const PLAYBACK_EVENT_FIELDS = ["elapsedMs", "type", "positionMs", "readyState", "flags"];
+const PLAYBACK_EVENT_FLAGS = { paused: 1, muted: 2 };
+const BUFFER_CHANGE_FIELDS = ["elapsedMs", "rangesMs"];
 
 if (import.meta.env.DEV) {
   let report = loadReport() || createReport();
@@ -14,15 +41,18 @@ if (import.meta.env.DEV) {
   function redactUrl(value) {
     try {
       const url = new URL(value);
-      return `${url.origin}${url.pathname}${url.search ? "?[redacted]" : ""}`;
+      return `${url.origin}/[redacted-path]`;
     } catch {
-      return String(value).replace(/[?].*$/, "?[redacted]");
+      return "[redacted-url]";
     }
   }
 
   function redact(value, key = "") {
     if (typeof value === "string") {
-      return /url|uri|href|source|playlist|media/i.test(key) ? redactUrl(value) : value;
+      if (/url|uri|href|source|playlist|media/i.test(key) || /^https?:\/\//i.test(value)) {
+        return redactUrl(value);
+      }
+      return value.replace(/https?:\/\/[^\s"']+/gi, (url) => redactUrl(url));
     }
     if (Array.isArray(value)) {
       return value.map((item) => redact(item));
@@ -40,18 +70,20 @@ if (import.meta.env.DEV) {
       startedAt: new Date().toISOString(),
       page: {
         href: redactUrl(window.location.href),
-        origin: window.location.origin,
         userAgent: navigator.userAgent
       },
-      context: {
-        roomId: null,
-        media: null
-      },
+      context: { roomId: null, media: null },
+      sampleFields: SAMPLE_FIELDS,
+      sampleFlags: SAMPLE_FLAGS,
+      samples: [],
+      bufferChangeFields: BUFFER_CHANGE_FIELDS,
+      bufferChanges: [],
+      playbackEventFields: PLAYBACK_EVENT_FIELDS,
+      playbackEventFlags: PLAYBACK_EVENT_FLAGS,
+      playbackEvents: [],
+      diagnostics: [],
       lifecycle: [],
       messages: [],
-      samples: [],
-      diagnostics: [],
-      playbackEvents: [],
       errors: []
     };
   }
@@ -69,26 +101,24 @@ if (import.meta.env.DEV) {
   }
 
   function findLastBufferedRangesKey() {
-    for (let index = report.samples.length - 1; index >= 0; index -= 1) {
-      const ranges = report.samples[index].bufferedRanges;
-      if (ranges) {
-        return JSON.stringify(ranges);
-      }
-    }
-    return "";
+    const lastChange = report.bufferChanges.at(-1);
+    return lastChange ? JSON.stringify(lastChange[1]) : "";
+  }
+
+  function elapsedMs(at = Date.now()) {
+    return Math.max(0, Math.round(Number(at) - Date.parse(report.startedAt)));
+  }
+
+  function positionMs(value) {
+    return Number.isFinite(value) ? Math.round(value * 1_000) : null;
+  }
+
+  function integer(value, scale = 1) {
+    return Number.isFinite(value) ? Math.round(value / scale) : null;
   }
 
   function itemKey(item) {
-    return JSON.stringify([
-      item?.at,
-      item?.type,
-      item?.title,
-      item?.reason,
-      item?.version,
-      item?.currentTime,
-      item?.details,
-      item?.fatal
-    ]);
+    return JSON.stringify(item);
   }
 
   function createItemKeys(items) {
@@ -96,24 +126,121 @@ if (import.meta.env.DEV) {
   }
 
   function append(target, value) {
-    target.push(redact(value));
+    target.push(value);
     if (target.length > MAX_ITEMS) {
       target.splice(0, target.length - MAX_ITEMS);
     }
   }
 
-  function mergeUnique(target, items, keys, predicate) {
+  function fragmentIdentity(fragment) {
+    if (!fragment) {
+      return null;
+    }
+    let host = null;
+    try {
+      const url = new URL(fragment.url);
+      host = url.host;
+    } catch {}
+    return [
+      host,
+      fragment.level ?? null,
+      fragment.sequenceNumber ?? null,
+      positionMs(fragment.start),
+      positionMs(fragment.duration)
+    ];
+  }
+
+  function compactDiagnostic(item) {
+    const time = elapsedMs(item.at);
+    if (item.type === "action-sent") {
+      return { t: time, type: "action", action: item.actionType, version: item.knownVersion };
+    }
+    if (item.type === "hls-correction-deferred" || item.type === "hls-correction-queued") {
+      return {
+        t: time,
+        type: item.type === "hls-correction-queued" ? "queue" : "defer",
+        reason: item.reason,
+        errorMs: item.errorMs,
+        version: item.version
+      };
+    }
+    if (item.type === "hls-error") {
+      return {
+        t: time,
+        type: "hls-error",
+        detail: item.details,
+        fatal: item.fatal,
+        category: item.errorType,
+        status: item.response?.code ?? null,
+        fragment: fragmentIdentity(item.fragment),
+        retry: item.recovery
+          ? [item.recovery.retryCount ?? null, item.recovery.action ?? null, item.recovery.flags ?? null]
+          : null,
+        hls: item.hlsState
+          ? [
+              item.hlsState.currentLevel ?? null,
+              item.hlsState.loadLevel ?? null,
+              item.hlsState.nextLoadLevel ?? null,
+              integer(item.hlsState.bandwidthEstimate, 1_000)
+            ]
+          : null
+      };
+    }
+    if (item.type === "hls-fragment-loaded") {
+      return {
+        t: time,
+        type: "hls-loaded",
+        fragment: fragmentIdentity(item.fragment),
+        loadedBytes: integer(item.loadedBytes),
+        loadMs: integer(item.loadMs)
+      };
+    }
+    if (item.type === "event" && /activation|error|failed|recover|restart|unsupported/i.test(item.title || "")) {
+      return { t: time, type: "event", title: item.title, detail: redact(item.detail) };
+    }
+    return null;
+  }
+
+  function mergeDiagnostics(items) {
     const startedAtMs = Date.parse(report.startedAt);
     for (const item of Array.isArray(items) ? items : []) {
-      if (!Number.isFinite(item?.at) || item.at < startedAtMs || !predicate(item)) {
+      if (!Number.isFinite(item?.at) || item.at < startedAtMs || OMITTED_DIAGNOSTIC_TYPES.has(item.type)) {
         continue;
       }
-      const key = itemKey(item);
-      if (keys.has(key)) {
+      const compact = compactDiagnostic(item);
+      if (!compact) {
         continue;
       }
-      keys.add(key);
-      append(target, item);
+      const key = itemKey(compact);
+      if (diagnosticKeys.has(key)) {
+        continue;
+      }
+      diagnosticKeys.add(key);
+      append(report.diagnostics, compact);
+    }
+  }
+
+  function mergePlaybackEvents(items) {
+    const startedAtMs = Date.parse(report.startedAt);
+    for (const item of Array.isArray(items) ? items : []) {
+      if (!Number.isFinite(item?.at) || item.at < startedAtMs) {
+        continue;
+      }
+      const flags = (item.paused ? PLAYBACK_EVENT_FLAGS.paused : 0) |
+        (item.muted ? PLAYBACK_EVENT_FLAGS.muted : 0);
+      const compact = [
+        elapsedMs(item.at),
+        item.type,
+        positionMs(item.currentTime),
+        item.readyState,
+        flags
+      ];
+      const key = itemKey(compact);
+      if (playbackEventKeys.has(key)) {
+        continue;
+      }
+      playbackEventKeys.add(key);
+      append(report.playbackEvents, compact);
     }
   }
 
@@ -122,6 +249,7 @@ if (import.meta.env.DEV) {
       sessionStorage.setItem(REPORT_STORAGE_KEY, JSON.stringify(report));
     } catch {
       report.samples.splice(0, Math.ceil(report.samples.length / 2));
+      report.bufferChanges.splice(0, Math.ceil(report.bufferChanges.length / 2));
       report.diagnostics.splice(0, Math.ceil(report.diagnostics.length / 2));
       report.playbackEvents.splice(0, Math.ceil(report.playbackEvents.length / 2));
       try {
@@ -130,58 +258,52 @@ if (import.meta.env.DEV) {
     }
   }
 
-  function finiteRounded(value, digits = 3) {
-    return Number.isFinite(value) ? Number(value.toFixed(digits)) : null;
+  function sampleFlags(pipeline) {
+    return (pipeline.paused ? SAMPLE_FLAGS.authoritativePaused : 0) |
+      (pipeline.localPaused ? SAMPLE_FLAGS.localPaused : 0) |
+      (pipeline.seeking ? SAMPLE_FLAGS.seeking : 0) |
+      (pipeline.hlsBuffering ? SAMPLE_FLAGS.hlsBuffering : 0) |
+      (pipeline.hlsCorrection?.awaitingPlayback ? SAMPLE_FLAGS.awaitingPlayback : 0);
   }
 
-  function collectSample(reason = "interval") {
+  function collectSample() {
     const pipeline = window.__getPlaybackPipelineState?.() ?? null;
     const interfaceState = window.__getInterfaceMediaState?.() ?? null;
     if (pipeline) {
-      const ranges = (pipeline.bufferedRanges || []).map((range) => ({
-        start: finiteRounded(range.start),
-        end: finiteRounded(range.end)
-      }));
+      const time = elapsedMs();
+      append(report.samples, [
+        time,
+        pipeline.version,
+        positionMs(pipeline.positionSec),
+        positionMs(pipeline.localPositionSec),
+        integer(pipeline.syncErrorMs),
+        pipeline.readyState,
+        pipeline.networkState,
+        sampleFlags(pipeline),
+        pipeline.hlsCorrection?.version ?? null,
+        pipeline.hlsCurrentLevel,
+        pipeline.hlsLoadLevel,
+        pipeline.hlsNextLoadLevel,
+        integer(pipeline.hlsBandwidthEstimate, 1_000),
+        integer(pipeline.roundTripMs),
+        integer(pipeline.clockOffsetMs)
+      ]);
+      const ranges = (pipeline.bufferedRanges || []).flatMap((range) => [
+        positionMs(range.start),
+        positionMs(range.end)
+      ]);
       const nextBufferedRangesKey = JSON.stringify(ranges);
-      const sample = {
-        at: Date.now(),
-        reason,
-        version: pipeline.version,
-        roomPositionSec: finiteRounded(pipeline.positionSec),
-        localPositionSec: finiteRounded(pipeline.localPositionSec),
-        syncErrorMs: pipeline.syncErrorMs,
-        readyState: pipeline.readyState,
-        networkState: pipeline.networkState,
-        authoritativePaused: pipeline.paused,
-        localPaused: pipeline.localPaused,
-        seeking: pipeline.seeking,
-        hlsBuffering: pipeline.hlsBuffering,
-        correctionVersion: pipeline.hlsCorrection?.version ?? null,
-        awaitingPlayback: pipeline.hlsCorrection?.awaitingPlayback ?? false,
-        currentLevel: pipeline.hlsCurrentLevel,
-        loadLevel: pipeline.hlsLoadLevel,
-        nextLoadLevel: pipeline.hlsNextLoadLevel,
-        bandwidthEstimate: pipeline.hlsBandwidthEstimate,
-        roundTripMs: pipeline.roundTripMs,
-        clockOffsetMs: pipeline.clockOffsetMs
-      };
       if (nextBufferedRangesKey !== bufferedRangesKey) {
-        sample.bufferedRanges = ranges;
+        append(report.bufferChanges, [time, ranges]);
         bufferedRangesKey = nextBufferedRangesKey;
       }
-      append(report.samples, sample);
       report.context.roomId = pipeline.roomId || report.context.roomId;
     }
     if (interfaceState) {
       report.context.media = redact(interfaceState);
     }
-    mergeUnique(
-      report.diagnostics,
-      window.__getSyncDiagnostics?.(),
-      diagnosticKeys,
-      (item) => !OMITTED_DIAGNOSTIC_TYPES.has(item.type)
-    );
-    mergeUnique(report.playbackEvents, window.__getPlaybackEvents?.(), playbackEventKeys, () => true);
+    mergeDiagnostics(window.__getSyncDiagnostics?.());
+    mergePlaybackEvents(window.__getPlaybackEvents?.());
     persistReport();
     updateStatus();
   }
@@ -191,8 +313,8 @@ if (import.meta.env.DEV) {
     diagnosticKeys = new Set();
     playbackEventKeys = new Set();
     bufferedRangesKey = "";
-    append(report.lifecycle, { at: new Date().toISOString(), type: reason });
-    collectSample("reset");
+    append(report.lifecycle, [0, reason]);
+    collectSample();
   }
 
   function reportFilename() {
@@ -202,9 +324,9 @@ if (import.meta.env.DEV) {
   }
 
   function downloadReport() {
-    collectSample("download");
-    const payload = JSON.stringify({ ...report, downloadedAt: new Date().toISOString() }, null, 2);
-    const url = URL.createObjectURL(new Blob([`${payload}\n`], { type: "application/json" }));
+    collectSample();
+    const payload = JSON.stringify({ ...report, downloadedAt: new Date().toISOString() });
+    const url = URL.createObjectURL(new Blob([payload], { type: "application/json" }));
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = reportFilename();
@@ -217,7 +339,7 @@ if (import.meta.env.DEV) {
     if (!statusElement) {
       return;
     }
-    const elapsedSec = Math.max(0, Math.round((Date.now() - Date.parse(report.startedAt)) / 1_000));
+    const elapsedSec = Math.floor(elapsedMs() / 1_000);
     statusElement.textContent = `${elapsedSec}s · ${report.diagnostics.length} events · ${report.playbackEvents.length} media`;
   }
 
@@ -250,39 +372,20 @@ if (import.meta.env.DEV) {
     if (!data?.type || !data.type.startsWith("WT_")) {
       return;
     }
-    append(report.messages, {
-      at: new Date().toISOString(),
-      type: data.type,
-      payload: data.payload ?? data
-    });
+    append(report.messages, [elapsedMs(), data.type, redact(data.payload ?? data)]);
   }
 
   function collectError(event) {
-    append(report.errors, {
-      at: new Date().toISOString(),
-      type: "error",
-      message: event.message,
-      source: event.filename,
-      line: event.lineno,
-      column: event.colno
-    });
+    append(report.errors, [elapsedMs(), "error", event.message, event.lineno, event.colno]);
     persistReport();
   }
 
   function collectRejection(event) {
-    append(report.errors, {
-      at: new Date().toISOString(),
-      type: "unhandledrejection",
-      reason: String(event.reason)
-    });
+    append(report.errors, [elapsedMs(), "unhandledrejection", String(event.reason)]);
     persistReport();
   }
 
-  append(report.lifecycle, {
-    at: new Date().toISOString(),
-    type: "page-load",
-    href: redactUrl(window.location.href)
-  });
+  append(report.lifecycle, [elapsedMs(), "page-load"]);
   window.addEventListener("message", collectMessage);
   window.addEventListener("error", collectError);
   window.addEventListener("unhandledrejection", collectRejection);
@@ -292,16 +395,16 @@ if (import.meta.env.DEV) {
       downloadReport();
     }
   });
-  window.addEventListener("pagehide", () => collectSample("pagehide"));
+  window.addEventListener("pagehide", collectSample);
   const diagnosticsApi = {
     download: downloadReport,
-    getReport: () => redact(report),
+    getReport: () => report,
     reset: () => resetReport("api-reset"),
-    snapshot: () => collectSample("manual")
+    snapshot: collectSample
   };
   Object.defineProperty(diagnosticsApi, "runId", { get: () => report.runId });
   window.__anyTogetherDiagnostics = diagnosticsApi;
   installToolbar();
-  collectSample("start");
-  window.setInterval(() => collectSample("interval"), SAMPLE_INTERVAL_MS);
+  collectSample();
+  window.setInterval(collectSample, SAMPLE_INTERVAL_MS);
 }

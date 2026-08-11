@@ -66,16 +66,51 @@ async function waitForMedia(page, mediaUrl) {
 }
 
 async function playbackSamples(pages, operationStartedAt = 0) {
-  return Promise.all(pages.map((page) => page.locator("#player").evaluate((video, startedAt) => ({
-    currentTime: video.currentTime,
-    paused: video.paused,
-    ended: video.ended,
-    readyState: video.readyState,
-    seeking: video.seeking,
-    fatalHlsErrors: (window.__getSyncDiagnostics?.() || []).filter((entry) => (
-      entry.type === "hls-error" && entry.fatal === true && entry.at >= startedAt
-    )).length
-  }), operationStartedAt)));
+  return Promise.all(pages.map((page) => page.locator("#player").evaluate((video, startedAt) => {
+    let forwardBufferSec = 0;
+    for (let index = 0; index < video.buffered.length; index += 1) {
+      if (video.currentTime >= video.buffered.start(index) - 0.05 && video.currentTime <= video.buffered.end(index)) {
+        forwardBufferSec = Math.max(forwardBufferSec, video.buffered.end(index) - video.currentTime);
+      }
+    }
+    return {
+      currentTime: video.currentTime,
+      duration: video.duration,
+      paused: video.paused,
+      ended: video.ended,
+      forwardBufferSec,
+      readyState: video.readyState,
+      seeking: video.seeking,
+      fatalHlsErrors: (window.__getSyncDiagnostics?.() || []).filter((entry) => (
+        entry.type === "hls-error" && entry.fatal === true && entry.at >= startedAt
+      )).length
+    };
+  }, operationStartedAt)));
+}
+
+function isPlaybackSampleStable(sample) {
+  const remainingSec = Number.isFinite(sample.duration)
+    ? Math.max(0, sample.duration - sample.currentTime)
+    : 2;
+  const requiredForwardBufferSec = Math.min(2, remainingSec);
+  return sample.readyState >= 3 &&
+    !sample.paused &&
+    !sample.seeking &&
+    !sample.ended &&
+    sample.forwardBufferSec >= requiredForwardBufferSec - 0.05;
+}
+
+async function playbackFailureDiagnostics(pages) {
+  return Promise.all(pages.map((page) => page.evaluate(() => {
+    const pipeline = window.__getPlaybackPipelineState?.() || null;
+    if (pipeline) {
+      delete pipeline.mediaUrl;
+    }
+    return {
+      pipeline,
+      diagnostics: (window.__getSyncDiagnostics?.() || []).slice(-30)
+    };
+  })));
 }
 
 async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncLog = null, persistSyncLog = null, operationStartedAt = Date.now()) {
@@ -94,9 +129,7 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
       if (samples.some((sample) => sample.fatalHlsErrors > 0)) {
         throw new Error("Fatal HLS error occurred while waiting for playback");
       }
-      const stablePlayback = samples.every((sample) => (
-        sample.readyState >= 3 && !sample.paused && !sample.seeking && !sample.ended
-      ));
+      const stablePlayback = samples.every(isPlaybackSampleStable);
       const clientsConverged = Math.abs(samples[0].currentTime - samples[1].currentTime) < 0.75;
       let authoritativeConvergence = true;
       if (expectedPosition !== undefined) {
@@ -130,7 +163,8 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
         fatalHlsErrorCount: finalSamples.reduce((total, sample) => total + sample.fatalHlsErrors, 0),
         hangDetected: true,
         convergenceTimedOut: Date.now() - synchronizationStartedAt >= convergenceTimeoutMs,
-        timeoutMs: convergenceTimeoutMs
+        timeoutMs: convergenceTimeoutMs,
+        failureDiagnostics: await playbackFailureDiagnostics([pageA, pageB])
       });
       if (persistSyncLog) {
         await persistSyncLog();
@@ -163,7 +197,7 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
   ));
   const minimumProgressSec = settleMs > 0 ? Math.min(0.75, settleMs / 2_000) : 0;
   const stablePlayback = settleEndSamples.every((sample) => (
-    sample.readyState >= 3 && !sample.paused && !sample.seeking && !sample.ended && sample.fatalHlsErrors === 0
+    isPlaybackSampleStable(sample) && sample.fatalHlsErrors === 0
   ));
   const clientsConverged = Math.abs(settleEndSamples[0].currentTime - settleEndSamples[1].currentTime) < 0.75;
   const hangDetected = progressDeltaSec.some((progress) => progress < minimumProgressSec);
@@ -172,14 +206,17 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
   const fatalHlsErrorCount = settleEndSamples.reduce((total, sample) => total + sample.fatalHlsErrors, 0);
 
   if (syncLog) {
+    const playbackFailed = fatalHlsErrorDuringSettle || fatalHlsErrorCount > 0 ||
+      hangDetected || unstablePlaybackDetected || desynchronizationDetected;
     syncLog.push({
       targetPosition: expectedPosition ?? null,
       loadingWaitMs,
       convergenceWaitMs: Date.now() - synchronizationStartedAt - settleMs,
       settledAfterMs: settleMs,
       totalWaitMs: Date.now() - synchronizationStartedAt,
-      samples: settleEndSamples.map(({ currentTime, paused, readyState, seeking }) => ({
+      samples: settleEndSamples.map(({ currentTime, forwardBufferSec, paused, readyState, seeking }) => ({
         currentTime,
+        forwardBufferSec,
         paused,
         readyState,
         seeking
@@ -189,7 +226,10 @@ async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncL
       fatalHlsErrorCount,
       hangDetected,
       unstablePlaybackDetected,
-      desynchronizationDetected
+      desynchronizationDetected,
+      ...(playbackFailed
+        ? { failureDiagnostics: await playbackFailureDiagnostics([pageA, pageB]) }
+        : {})
     });
     if (persistSyncLog) {
       await persistSyncLog();
@@ -363,11 +403,21 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
     await first.page.waitForTimeout(holdMs);
   }
 
+  const diagnosticReportBytes = await Promise.all([first.page, second.page].map((page) => (
+    page.evaluate(() => {
+      window.__anyTogetherDiagnostics?.snapshot();
+      const report = window.__anyTogetherDiagnostics?.getReport() || {};
+      return new TextEncoder().encode(JSON.stringify(report)).byteLength;
+    })
+  )));
+  expect(Math.max(...diagnosticReportBytes)).toBeLessThan(50 * 1_024);
+
   await testInfo.attach("e2e-sync-summary", {
     body: Buffer.from(JSON.stringify({
       config: { ...config, mediaUrl: config.mediaUrl ? "[redacted]" : "" },
       roomId,
       seekCount,
+      diagnosticReportBytes,
       entries: syncLog
     }, null, 2)),
     contentType: "application/json"

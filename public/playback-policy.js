@@ -23,11 +23,42 @@ export function getPlaybackToggleIntent(roomState, localPaused) {
   return roomState.playback.paused ? "play" : "pause";
 }
 
+export function getBufferedCorrectionPosition(
+  ranges,
+  positionSec,
+  marginSec = 0.05,
+  minimumAheadSec = 2
+) {
+  if (!Number.isFinite(positionSec)) {
+    return null;
+  }
+  for (const range of ranges) {
+    if (
+      Number.isFinite(range.start) &&
+      Number.isFinite(range.end) &&
+      positionSec >= range.start - marginSec &&
+      positionSec <= range.end - Math.max(marginSec, minimumAheadSec)
+    ) {
+      return Math.max(positionSec, range.start + marginSec);
+    }
+  }
+  return null;
+}
+
 export function shouldDeferHlsCorrection(roomState, correction, playerState) {
   return Boolean(
     roomState.media?.kind === "hls" &&
     !roomState.playback.paused &&
     correction?.version === roomState.version &&
     (correction.awaitingPlayback || playerState.buffering || playerState.seeking)
+  );
+}
+
+export function shouldQueueHlsCorrection(roomState, correction, playerState) {
+  return Boolean(
+    roomState.media?.kind === "hls" &&
+    !roomState.playback.paused &&
+    correction?.version !== roomState.version &&
+    (correction?.awaitingPlayback || playerState.buffering || playerState.seeking)
   );
 }

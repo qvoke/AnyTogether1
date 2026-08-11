@@ -3,8 +3,10 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   getPlaybackToggleIntent,
+  getBufferedCorrectionPosition,
   getRelativeSeekPosition,
-  shouldDeferHlsCorrection
+  shouldDeferHlsCorrection,
+  shouldQueueHlsCorrection
 } from "../public/playback-policy.js";
 
 test("relative seeks use the authoritative server-time position", () => {
@@ -39,6 +41,20 @@ test("a locally blocked participant activates playback without pausing the room"
   assert.equal(getPlaybackToggleIntent({ media: null, playback: { paused: true } }, true), null);
 });
 
+test("HLS follow-up corrections only reuse an existing buffered range", () => {
+  const ranges = [
+    { start: 10, end: 20 },
+    { start: 30, end: 40 }
+  ];
+
+  assert.equal(getBufferedCorrectionPosition(ranges, 15), 15);
+  assert.equal(getBufferedCorrectionPosition(ranges, 18.5), null);
+  assert.equal(getBufferedCorrectionPosition(ranges, 20), null);
+  assert.equal(getBufferedCorrectionPosition(ranges, 29.97), 30.05);
+  assert.equal(getBufferedCorrectionPosition(ranges, 25), null);
+  assert.equal(getBufferedCorrectionPosition(ranges, Number.NaN), null);
+});
+
 test("HLS correction waits for stable playback after a remote seek", () => {
   const roomState = {
     media: { id: "media-1", kind: "hls" },
@@ -71,6 +87,44 @@ test("HLS correction waits for stable playback after a remote seek", () => {
     shouldDeferHlsCorrection(
       { ...roomState, version: 8 },
       correction,
+      { buffering: true, seeking: true }
+    ),
+    false
+  );
+});
+
+test("a newer HLS seek is queued while the previous correction is unstable", () => {
+  const roomState = {
+    media: { id: "media-1", kind: "hls" },
+    playback: { paused: false },
+    version: 8
+  };
+  const previousCorrection = { awaitingPlayback: true, version: 7 };
+
+  assert.equal(
+    shouldQueueHlsCorrection(roomState, previousCorrection, { buffering: true, seeking: true }),
+    true
+  );
+  assert.equal(
+    shouldQueueHlsCorrection(
+      roomState,
+      { ...previousCorrection, awaitingPlayback: false },
+      { buffering: false, seeking: false }
+    ),
+    false
+  );
+  assert.equal(
+    shouldQueueHlsCorrection(
+      { ...roomState, playback: { paused: true } },
+      previousCorrection,
+      { buffering: true, seeking: true }
+    ),
+    false
+  );
+  assert.equal(
+    shouldQueueHlsCorrection(
+      { ...roomState, media: { id: "media-1", kind: "mp4" } },
+      previousCorrection,
       { buffering: true, seeking: true }
     ),
     false

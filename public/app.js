@@ -1,7 +1,9 @@
 import {
   getPlaybackToggleIntent,
+  getBufferedCorrectionPosition,
   getRelativeSeekPosition,
-  shouldDeferHlsCorrection
+  shouldDeferHlsCorrection,
+  shouldQueueHlsCorrection
 } from "./playback-policy.js";
 
 const elements = {
@@ -19,6 +21,10 @@ const RECONNECT_DELAY_MS = 1_200;
 const PERIODIC_SYNC_INTERVAL_MS = 3_000;
 const HARD_SYNC_THRESHOLD_SEC = 0.15;
 const SOFT_SYNC_THRESHOLD_SEC = 0.04;
+const HLS_FOLLOW_UP_INTERVAL_MS = 250;
+const HLS_LATENCY_COMPENSATION_LIMIT_MS = 1_000;
+const HLS_NETWORK_RECOVERY_DELAY_MS = 250;
+const HLS_NETWORK_RECOVERY_LIMIT = 3;
 const Hls = window.Hls;
 const DIAGNOSTIC_STORAGE_KEY = "anytogether:sync-diagnostics";
 const MAX_DIAGNOSTIC_ENTRIES = 300;
@@ -28,11 +34,15 @@ const state = {
   clockOffsetMs: 0,
   connection: null,
   connectionGeneration: 0,
+  deferredHlsCorrection: null,
   hls: null,
   hlsBuffering: false,
   hlsCorrection: null,
+  hlsFollowUpTimer: null,
+  hlsRecoveryTimer: null,
   lastHlsRecoveryAt: 0,
   lastHlsLoadVersion: null,
+  lastHlsNetworkRecovery: null,
   lastSyncErrorMs: 0,
   playbackBlocked: false,
   reconnectTimer: null,
@@ -70,7 +80,7 @@ function logSyncEvent(title, detail = "") {
 function storeDiagnostic(entry) {
   try {
     const stored = JSON.parse(localStorage.getItem(DIAGNOSTIC_STORAGE_KEY) || "[]");
-    const diagnostics = Array.isArray(stored) ? stored : [];
+    const diagnostics = (Array.isArray(stored) ? stored : []).map(redactDiagnostic);
     diagnostics.push(redactDiagnostic({ at: Date.now(), ...entry }));
     localStorage.setItem(DIAGNOSTIC_STORAGE_KEY, JSON.stringify(diagnostics.slice(-MAX_DIAGNOSTIC_ENTRIES)));
   } catch {}
@@ -81,14 +91,14 @@ function redactDiagnostic(value) {
     if (typeof item !== "string") {
       return item;
     }
-    return item.replace(/https:\/\/[^\s"']+/gi, sanitizeDiagnosticUrl);
+    return item.replace(/https?:\/\/[^\s"']+/gi, sanitizeDiagnosticUrl);
   }));
 }
 
 function sanitizeDiagnosticUrl(value) {
   try {
     const url = new URL(value);
-    return `${url.origin}${url.pathname}${url.search ? "?[redacted]" : ""}`;
+    return `${url.origin}/[redacted-path]`;
   } catch {
     return "[redacted-url]";
   }
@@ -372,12 +382,31 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
       return;
     }
     const requiresHardCorrection = absoluteError > HARD_SYNC_THRESHOLD_SEC || player.paused;
+    const playerState = {
+      buffering: state.hlsBuffering,
+      seeking: player.seeking
+    };
     if (
       requiresHardCorrection &&
-      shouldDeferHlsCorrection(roomState, state.hlsCorrection, {
-        buffering: state.hlsBuffering,
-        seeking: player.seeking
-      })
+      shouldQueueHlsCorrection(roomState, state.hlsCorrection, playerState)
+    ) {
+      if (state.deferredHlsCorrection?.version !== roomState.version) {
+        storeDiagnostic({
+          type: "hls-correction-queued",
+          errorMs: state.lastSyncErrorMs,
+          reason,
+          version: roomState.version
+        });
+      }
+      state.deferredHlsCorrection = { version: roomState.version };
+      player.playbackRate = 1;
+      requestAuthoritativePlayback(player);
+      setPlaybackState();
+      return;
+    }
+    if (
+      requiresHardCorrection &&
+      shouldDeferHlsCorrection(roomState, state.hlsCorrection, playerState)
     ) {
       player.playbackRate = 1;
       storeDiagnostic({
@@ -386,6 +415,23 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
         reason,
         version: roomState.version
       });
+      requestAuthoritativePlayback(player);
+      setPlaybackState();
+      return;
+    }
+    const hasSettledHlsCorrection = roomState.media.kind === "hls" &&
+      state.hlsCorrection?.version === roomState.version &&
+      !state.hlsCorrection.awaitingPlayback;
+    if (requiresHardCorrection && hasSettledHlsCorrection) {
+      const correctionPosition = getHlsFollowUpPosition(roomState, player);
+      const bufferedPosition = getPlayerBufferedCorrectionPosition(player, correctionPosition);
+      if (!state.hlsCorrection.followUpApplied && bufferedPosition !== null) {
+        setRemotePosition(player, bufferedPosition, roomState, true);
+      } else if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
+        player.playbackRate = error > 0 ? 1.04 : 0.96;
+        resetPlaybackRate(player);
+      }
+      scheduleHlsFollowUpCorrection();
       requestAuthoritativePlayback(player);
       setPlaybackState();
       return;
@@ -424,6 +470,79 @@ function resetPlaybackRate(player) {
   }, 1_600);
 }
 
+function getPlayerBufferedCorrectionPosition(player, positionSec) {
+  const bufferedRanges = Array.from({ length: player.buffered.length }, (_item, index) => ({
+    end: player.buffered.end(index),
+    start: player.buffered.start(index)
+  }));
+  return getBufferedCorrectionPosition(bufferedRanges, positionSec);
+}
+
+function getHlsFollowUpPosition(roomState, player) {
+  const expectedPosition = getPositionAt(roomState, estimateServerNow());
+  const latencySec = Math.min(
+    HLS_LATENCY_COMPENSATION_LIMIT_MS,
+    Math.max(0, state.hlsCorrection?.settleLatencyMs || 0)
+  ) / 1_000;
+  return clampPosition(expectedPosition + latencySec, player.duration);
+}
+
+function markHlsCorrectionReady(player) {
+  const correction = state.hlsCorrection;
+  if (!correction || player.paused || player.seeking) {
+    return;
+  }
+  if (correction.awaitingPlayback && Number.isFinite(correction.startedAtMs)) {
+    correction.settleLatencyMs = Math.min(
+      HLS_LATENCY_COMPENSATION_LIMIT_MS,
+      Math.max(0, performance.now() - correction.startedAtMs)
+    );
+  }
+  correction.awaitingPlayback = false;
+  scheduleHlsFollowUpCorrection();
+}
+
+function scheduleHlsFollowUpCorrection() {
+  const correction = state.hlsCorrection;
+  if (
+    state.hlsFollowUpTimer !== null ||
+    correction?.version !== state.roomState?.version ||
+    state.roomState?.media?.kind !== "hls" ||
+    state.roomState.playback.paused ||
+    correction.awaitingPlayback ||
+    correction.followUpApplied
+  ) {
+    return;
+  }
+  state.hlsFollowUpTimer = window.setTimeout(() => {
+    state.hlsFollowUpTimer = null;
+    const player = elements.player;
+    const roomState = state.roomState;
+    const latestCorrection = state.hlsCorrection;
+    if (
+      !player ||
+      !roomState?.media ||
+      roomState.media.kind !== "hls" ||
+      roomState.playback.paused ||
+      latestCorrection?.version !== roomState.version ||
+      latestCorrection.awaitingPlayback ||
+      latestCorrection.followUpApplied
+    ) {
+      return;
+    }
+    const expectedPosition = clampPosition(getPositionAt(roomState, estimateServerNow()), player.duration);
+    if (Math.abs(expectedPosition - player.currentTime) <= HARD_SYNC_THRESHOLD_SEC) {
+      latestCorrection.followUpApplied = true;
+      return;
+    }
+    const correctionPosition = getHlsFollowUpPosition(roomState, player);
+    if (getPlayerBufferedCorrectionPosition(player, correctionPosition) !== null) {
+      synchronizePlayer("hls-buffer-ready");
+    }
+    scheduleHlsFollowUpCorrection();
+  }, HLS_FOLLOW_UP_INTERVAL_MS);
+}
+
 function requestAuthoritativePlayback(player) {
   if (state.playbackBlocked || !player.paused || player.ended) {
     return;
@@ -436,16 +555,38 @@ function requestAuthoritativePlayback(player) {
   });
 }
 
-function setRemotePosition(player, positionSec, roomState) {
+function setRemotePosition(player, positionSec, roomState, followUpApplied = false) {
+  state.deferredHlsCorrection = null;
+  const settleLatencyMs = followUpApplied && state.hlsCorrection?.version === roomState.version
+    ? state.hlsCorrection.settleLatencyMs
+    : 0;
   state.hlsCorrection = roomState.media?.kind === "hls"
-    ? { awaitingPlayback: !roomState.playback.paused, version: roomState.version }
+    ? {
+        awaitingPlayback: !roomState.playback.paused,
+        followUpApplied,
+        settleLatencyMs,
+        startedAtMs: performance.now(),
+        version: roomState.version
+      }
     : null;
   player.currentTime = positionSec;
 }
 
-function unloadSource() {
+function unloadSource(options = {}) {
   const player = elements.player;
+  if (!options.preserveNetworkRecovery) {
+    state.lastHlsNetworkRecovery = null;
+  }
+  if (state.hlsRecoveryTimer !== null) {
+    window.clearTimeout(state.hlsRecoveryTimer);
+    state.hlsRecoveryTimer = null;
+  }
+  if (state.hlsFollowUpTimer !== null) {
+    window.clearTimeout(state.hlsFollowUpTimer);
+    state.hlsFollowUpTimer = null;
+  }
   state.hls?.destroy();
+  state.deferredHlsCorrection = null;
   state.hls = null;
   state.hlsBuffering = false;
   state.hlsCorrection = null;
@@ -460,13 +601,13 @@ function unloadSource() {
   player.load();
 }
 
-function loadSource(media) {
+function loadSource(media, options = {}) {
   const player = elements.player;
   if (!player) {
     return;
   }
 
-  unloadSource();
+  unloadSource(options);
   if (!media) {
     return;
   }
@@ -495,6 +636,8 @@ function loadSource(media) {
         logSyncEvent("Unsupported HLS source", "Live HLS is not supported in synchronized rooms.");
       }
     });
+    hls.on(Hls.Events.FRAG_LOADED, (_event, data) => handleHlsFragmentLoaded(hls, data));
+    hls.on(Hls.Events.FRAG_BUFFERED, () => handleHlsFragmentBuffered(hls));
     hls.on(Hls.Events.ERROR, (_event, data) => handleHlsError(hls, data));
     hls.loadSource(media.url);
     hls.attachMedia(player);
@@ -510,6 +653,53 @@ function loadSource(media) {
   logSyncEvent("Unsupported HLS source", "This browser cannot play HLS video.");
 }
 
+function getHlsFragmentDiagnostic(fragment) {
+  return fragment
+    ? {
+        duration: fragment.duration,
+        level: fragment.level,
+        sequenceNumber: fragment.sn,
+        start: fragment.start,
+        url: fragment.url
+      }
+    : null;
+}
+
+function handleHlsFragmentLoaded(hls, data) {
+  if (hls !== state.hls) {
+    return;
+  }
+  state.lastHlsNetworkRecovery = null;
+  if (state.hlsRecoveryTimer !== null) {
+    window.clearTimeout(state.hlsRecoveryTimer);
+    state.hlsRecoveryTimer = null;
+  }
+  const stats = data.stats || data.frag?.stats;
+  const loading = stats?.loading;
+  storeDiagnostic({
+    type: "hls-fragment-loaded",
+    fragment: getHlsFragmentDiagnostic(data.frag),
+    loadedBytes: stats?.loaded ?? null,
+    loadMs: Number.isFinite(loading?.end) && Number.isFinite(loading?.start)
+      ? Math.max(0, loading.end - loading.start)
+      : null
+  });
+}
+
+function handleHlsFragmentBuffered(hls) {
+  if (hls !== state.hls) {
+    return;
+  }
+  const correction = state.hlsCorrection;
+  if (
+    correction?.version === state.roomState?.version &&
+    !correction.awaitingPlayback &&
+    !correction.followUpApplied
+  ) {
+    scheduleHlsFollowUpCorrection();
+  }
+}
+
 function handleHlsError(hls, data) {
   const fragment = data.frag;
   storeDiagnostic({
@@ -517,15 +707,7 @@ function handleHlsError(hls, data) {
     details: data.details,
     fatal: data.fatal,
     errorType: data.type,
-    fragment: fragment
-      ? {
-          duration: fragment.duration,
-          level: fragment.level,
-          sequenceNumber: fragment.sn,
-          start: fragment.start,
-          url: fragment.url
-        }
-      : null,
+    fragment: getHlsFragmentDiagnostic(fragment),
     hlsState: {
       autoLevelEnabled: hls.autoLevelEnabled,
       bandwidthEstimate: hls.bandwidthEstimate,
@@ -561,6 +743,10 @@ function handleHlsError(hls, data) {
     logSyncEvent("HLS is correcting a buffer gap after the seek.");
     return;
   }
+  if (shouldRecoverHlsNetworkEarly(data)) {
+    scheduleHlsNetworkRecovery(hls);
+    return;
+  }
   if (!data.fatal) {
     return;
   }
@@ -582,10 +768,55 @@ function handleHlsError(hls, data) {
     return;
   }
   if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-    logSyncEvent("HLS segment loading failed after retries.");
+    scheduleHlsNetworkRecovery(hls);
     return;
   }
   logSyncEvent("HLS playback error", data.details || "Unknown HLS error");
+}
+
+function scheduleHlsNetworkRecovery(hls) {
+  const roomState = state.roomState;
+  if (hls !== state.hls || !roomState?.media || roomState.media.kind !== "hls") {
+    return;
+  }
+  const previousRecovery = state.lastHlsNetworkRecovery;
+  const attempts = previousRecovery?.mediaId === roomState.media.id &&
+    previousRecovery?.version === roomState.version
+    ? previousRecovery.attempts
+    : 0;
+  if (attempts >= HLS_NETWORK_RECOVERY_LIMIT) {
+    logSyncEvent("HLS segment loading failed after pipeline recovery.");
+    return;
+  }
+  const recovery = {
+    attempts: attempts + 1,
+    mediaId: roomState.media.id,
+    version: roomState.version
+  };
+  state.lastHlsNetworkRecovery = recovery;
+  if (state.hlsRecoveryTimer !== null) {
+    return;
+  }
+  hls.stopLoad();
+  logSyncEvent("Restarting the HLS pipeline after a network failure.");
+  state.hlsRecoveryTimer = window.setTimeout(() => {
+    state.hlsRecoveryTimer = null;
+    const latestState = state.roomState;
+    if (state.hls !== hls || latestState?.media?.id !== recovery.mediaId) {
+      return;
+    }
+    loadSource(latestState.media, { preserveNetworkRecovery: true });
+  }, HLS_NETWORK_RECOVERY_DELAY_MS);
+}
+
+function shouldRecoverHlsNetworkEarly(data) {
+  const retryCount = data.errorAction?.retryCount ?? data.stats?.retry ?? 0;
+  const responseCode = data.response?.code ?? 0;
+  return data.type === Hls.ErrorTypes.NETWORK_ERROR &&
+    !data.fatal &&
+    data.details === "fragLoadError" &&
+    retryCount >= 1 &&
+    responseCode >= 400;
 }
 
 function loadInterfaceMedia(url, forceReload = false) {
@@ -612,7 +843,13 @@ function bindPlayerEvents() {
   }
 
   player.addEventListener("loadedmetadata", () => synchronizePlayer("metadata"));
-  player.addEventListener("canplay", () => synchronizePlayer("canplay"));
+  player.addEventListener("canplay", () => {
+    if (!player.seeking) {
+      state.hlsBuffering = false;
+      markHlsCorrectionReady(player);
+    }
+    synchronizePlayer("canplay");
+  });
   player.addEventListener("waiting", () => {
     state.hlsBuffering = state.roomState?.media?.kind === "hls";
     state.remotePlayUntil = performance.now() + 60_000;
@@ -621,18 +858,23 @@ function bindPlayerEvents() {
   });
   player.addEventListener("playing", () => {
     state.hlsBuffering = false;
-    if (state.hlsCorrection?.version === state.roomState?.version && !player.seeking) {
-      state.hlsCorrection.awaitingPlayback = false;
-    }
+    markHlsCorrectionReady(player);
     setPlaybackBlocked(false);
     state.remotePlayUntil = 0;
     recordPlaybackEvent("playing", player);
     logSyncEvent("Playing in sync.");
+    if (state.roomState?.media?.kind === "hls") {
+      window.setTimeout(() => synchronizePlayer("hls-playing"), 0);
+    }
   });
   player.addEventListener("seeking", () => {
     recordPlaybackEvent("seeking", player);
   });
   player.addEventListener("seeked", () => {
+    if (player.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+      state.hlsBuffering = false;
+      markHlsCorrectionReady(player);
+    }
     recordPlaybackEvent("seeked", player);
     synchronizePlayer("seeked");
   });
@@ -664,6 +906,9 @@ function bindPlayerEvents() {
 
 function requestAutoplay() {
   setPlaybackBlocked(false);
+  if (state.hlsCorrection?.awaitingPlayback) {
+    state.hlsCorrection.startedAtMs = performance.now();
+  }
   synchronizePlayer("requested-autoplay");
 }
 
