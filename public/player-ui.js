@@ -212,6 +212,12 @@ function bindEvents() {
     UI.playBtn.setAttribute('aria-label', UI.playBtn.title);
     updatePlayBtn();
   });
+  window.addEventListener('anytogether:playback-telemetry', (event) => {
+    if (UI.centerSpinner) {
+      UI.centerSpinner.classList.toggle('visible', event.detail?.buffering === true);
+    }
+    updatePlayBtn();
+  });
 
   UI.settingsBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -254,7 +260,8 @@ function bindEvents() {
     if (UI.centerSpinner) UI.centerSpinner.classList.add('visible');
   });
   video.addEventListener('canplay', () => {
-    if (UI.centerSpinner) UI.centerSpinner.classList.remove('visible');
+    const syncInfo = window.__getPlaybackSyncInfo?.();
+    if (UI.centerSpinner && syncInfo?.buffering !== true) UI.centerSpinner.classList.remove('visible');
   });
   video.addEventListener('playing', () => {
     if (UI.centerSpinner) UI.centerSpinner.classList.remove('visible');
@@ -360,7 +367,9 @@ function updateVolumeIcon() {
 
 function updatePlayBtn() {
   if (!UI.playBtn) return;
-  UI.playBtn.innerHTML = video.paused
+  const syncInfo = window.__getPlaybackSyncInfo?.();
+  const paused = syncInfo?.active ? syncInfo.authoritativePaused : video.paused;
+  UI.playBtn.innerHTML = paused
     ? '<svg viewBox="0 0 24 24" width="20" height="20"><polygon points="6,4 20,12 6,20" fill="currentColor"/></svg>'
     : '<svg viewBox="0 0 24 24" width="20" height="20"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>';
 }

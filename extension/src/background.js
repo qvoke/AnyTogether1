@@ -1,6 +1,11 @@
 import { getParserConfigForUrl } from "./parser-configs.js";
 import { extractSeriesContextInPage } from "./extraction-engine.js";
 import { createUiRegistry, UI_REGISTRATION_STORAGE_KEY } from "./ui-registry.js";
+import {
+  buildDirectStreamResolution,
+  createDirectResolverRequest,
+  findDirectResolverConfig
+} from "./direct-resolver.js";
 
 const SEARCH_REQUEST_EVENT = "WT_SEARCH_REQUEST";
 const RESOLVE_PAGE_REQUEST_EVENT = "WT_RESOLVE_PAGE_URL";
@@ -298,90 +303,6 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function normalizeQualityLabel(label) {
-  return String(label || "")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function isPlayableQualityLabel(label) {
-  const normalized = normalizeQualityLabel(label);
-  if (!normalized) return false;
-  if (normalized.includes("ultra")) return false;
-
-  const compact = normalized.replace(/\s+/g, "");
-  return /^(?:\d{3,4}(?:p|hd|fhd|uhd)?|\d{3,4}x\d{3,4}|[48]k)$/.test(compact);
-}
-
-function parseStreamOptions(streamText) {
-  if (typeof streamText !== "string" || !streamText) return [];
-
-  const options = [];
-  const entries = streamText.split(/,(?=\[[^\]]+\])/g);
-
-  for (const entry of entries) {
-    const labelMatch = entry.match(/^\[([^\]]+)\]/);
-    const urlMatch = entry.match(/https?:\/\/[^\s"'<>]+/i);
-
-    if (!labelMatch || !urlMatch) continue;
-
-    const label = String(labelMatch[1] || "")
-      .replace(/<[^>]*>/g, " ")
-      .replace(/&nbsp;/gi, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    const url = String(urlMatch[0] || "").trim();
-
-    if (!label || !url) continue;
-    if (!isPlayableQualityLabel(label)) continue;
-
-    options.push({
-      label,
-      normalizedLabel: normalizeQualityLabel(label),
-      url
-    });
-  }
-
-  return options;
-}
-
-function pickStreamOption(options, preferredQualityLabel, defaultQualityLabel) {
-  if (!Array.isArray(options) || options.length === 0) return null;
-
-  const parseResolution = (label) => {
-    const value = Number.parseInt(String(label || "").replace(/[^0-9]/g, ""), 10);
-    return Number.isFinite(value) ? value : null;
-  };
-
-  const preferred = normalizeQualityLabel(preferredQualityLabel);
-  if (preferred) {
-    const exactMatch = options.find((option) => option.normalizedLabel === preferred);
-    if (exactMatch) return exactMatch;
-
-    const looseMatch = options.find((option) => option.normalizedLabel.includes(preferred));
-    if (looseMatch) return looseMatch;
-  }
-
-  const ranked = options
-    .map((option) => ({ option, resolution: parseResolution(option.label) ?? parseResolution(option.normalizedLabel) ?? 0 }))
-    .sort((a, b) => b.resolution - a.resolution);
-
-  if (ranked.length && ranked[0].resolution > 0) {
-    return ranked[0].option;
-  }
-
-  const defaultMatch = normalizeQualityLabel(defaultQualityLabel);
-  if (defaultMatch) {
-    const exactDefault = options.find((option) => option.normalizedLabel === defaultMatch);
-    if (exactDefault) return exactDefault;
-  }
-
-  return options[0];
-}
-
 function pickHighestStreamOption(options) {
   if (!Array.isArray(options) || options.length === 0) return null;
   return options
@@ -389,76 +310,15 @@ function pickHighestStreamOption(options) {
     .sort((left, right) => right.resolution - left.resolution)[0]?.option || options[0];
 }
 
-function readObjectPath(value, path) {
-  const parts = String(path || "").split(".").filter(Boolean);
-  let current = value;
-  for (const part of parts) {
-    if (current == null) return null;
-    current = current[part];
-  }
-  return current ?? null;
-}
-
-function resolveConfigValue(expression, context) {
-  if (typeof expression !== "string" || !expression.startsWith("$")) {
-    return expression;
-  }
-
-  return readObjectPath(context, expression.slice(1));
-}
-
-function getDirectResolverContext(seriesContext, targetEpisode, options = {}) {
-  const resolver = seriesContext?.resolver || {};
-  return {
-    resolver,
-    target: targetEpisode || {},
-    selectedTranslatorId: Number.isFinite(Number(options.translatorId))
-      ? Number(options.translatorId)
-      : Number(seriesContext?.selectedTranslatorId ?? resolver.translatorId ?? null),
-    selectedQualityLabel: options.qualityLabel || seriesContext?.selectedQualityLabel || null
-  };
-}
-
-function findDirectResolverConfig(profile, seriesContext, source = {}) {
-  const resolverType = source.resolverType || "ajaxStreamList";
-  const provider = seriesContext?.resolver?.provider || null;
-  return (Array.isArray(profile?.directResolvers) ? profile.directResolvers : []).find((resolverConfig) =>
-    resolverConfig?.type === resolverType &&
-    (!resolverConfig.provider || !provider || resolverConfig.provider === provider)
-  ) || null;
-}
-
 async function fetchDirectStreamList(resolverConfig, seriesContext, targetEpisode, options = {}) {
-  if (!resolverConfig || resolverConfig.type !== "ajaxStreamList" || !seriesContext || !targetEpisode) {
-    return null;
-  }
-
-  const context = getDirectResolverContext(seriesContext, targetEpisode, options);
-  const origin = context.resolver.origin || seriesContext?.resolver?.origin;
-  if (!origin || !resolverConfig.url) return null;
-
-  const endpoint = new URL(resolverConfig.url, origin);
-  if (resolverConfig.timestampQuery) {
-    endpoint.searchParams.set(resolverConfig.timestampQuery, String(Date.now()));
-  }
-
-  const bodyValues = {};
-  for (const [key, value] of Object.entries(resolverConfig.body || {})) {
-    const resolvedValue = resolveConfigValue(value, context);
-    bodyValues[key] = resolvedValue == null ? "" : String(resolvedValue);
-  }
+  const request = createDirectResolverRequest(resolverConfig, seriesContext, targetEpisode, options);
+  if (!request) return null;
 
   try {
     if (resolverConfig.executionContext === "page" && Number.isFinite(options.tabId)) {
       const [result] = await chrome.scripting.executeScript({
         target: { tabId: options.tabId },
-        args: [{
-          url: endpoint.href,
-          method: resolverConfig.method || "POST",
-          headers: resolverConfig.headers || {},
-          credentials: resolverConfig.credentials || "same-origin",
-          bodyValues
-        }],
+        args: [request],
         func: async (request) => {
           try {
             const response = await fetch(request.url, {
@@ -477,11 +337,11 @@ async function fetchDirectStreamList(resolverConfig, seriesContext, targetEpisod
       return result?.result || null;
     }
 
-    const response = await fetch(endpoint.href, {
-      method: resolverConfig.method || "POST",
-      headers: resolverConfig.headers || {},
-      credentials: resolverConfig.credentials || "same-origin",
-      body: new URLSearchParams(bodyValues)
+    const response = await fetch(request.url, {
+      method: request.method,
+      headers: request.headers,
+      credentials: request.credentials,
+      body: new URLSearchParams(request.bodyValues)
     });
 
     if (!response.ok) return null;
@@ -489,48 +349,6 @@ async function fetchDirectStreamList(resolverConfig, seriesContext, targetEpisod
   } catch {
     return null;
   }
-}
-
-function buildDirectStreamResolution(resolverConfig, ajaxData, seriesContext, targetEpisode, options = {}) {
-  const responseConfig = resolverConfig?.response || {};
-  const streamList = readObjectPath(ajaxData, responseConfig.streamListPath || "url");
-  if (!streamList || !seriesContext || !targetEpisode) return null;
-
-  const streamOptions = parseStreamOptions(streamList);
-  const selectedStream = pickStreamOption(
-    streamOptions,
-    options.qualityLabel,
-    responseConfig.defaultQualityPath
-      ? readObjectPath(ajaxData, responseConfig.defaultQualityPath)
-      : null
-  );
-
-  if (!selectedStream?.url) return null;
-
-  const seasonId = Number(targetEpisode.seasonId);
-  const episodeId = Number(targetEpisode.episodeId);
-  const episodes = Array.isArray(seriesContext.episodes) ? seriesContext.episodes : [];
-  const currentEpisodeIndex = episodes.findIndex(
-    (episode) => Number(episode?.seasonId) === seasonId && Number(episode?.episodeId) === episodeId
-  );
-
-  return {
-    mediaUrl: selectedStream.url,
-    masterPlaylistUrl: null,
-    pageUrl: seriesContext.resolver?.pageUrl || null,
-    seriesContext: {
-      ...seriesContext,
-      currentEpisodeIndex,
-      currentSeasonId: seasonId,
-      currentEpisodeId: episodeId,
-      selectedTranslatorId: Number(options.translatorId ?? seriesContext.selectedTranslatorId ?? seriesContext.resolver?.translatorId ?? null),
-      selectedQualityLabel: selectedStream.label,
-      availableQualities: streamOptions.map((option) => ({
-        label: option.label,
-        normalizedLabel: option.normalizedLabel
-      }))
-    }
-  };
 }
 
 async function resolveMediaFromSeriesContext(pageUrl, seriesContext, options = {}) {

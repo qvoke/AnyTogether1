@@ -1,9 +1,13 @@
 import {
+  getBufferedHlsAlignmentPosition,
+  getHlsAlignmentAllowanceSec,
   getPlaybackToggleIntent,
-  getHlsSyncPlaybackRate,
   getRelativeSeekPosition,
   shouldDeferHlsCorrection,
-  shouldQueueHlsCorrection
+  shouldQueueHlsCorrection,
+  shouldRunSettledHlsAlignment,
+  shouldScheduleSettledHlsAlignment,
+  shouldStartHlsPrimaryCorrection
 } from "./playback-policy.js";
 
 const elements = {
@@ -21,10 +25,21 @@ const RECONNECT_DELAY_MS = 1_200;
 const PERIODIC_SYNC_INTERVAL_MS = 3_000;
 const HARD_SYNC_THRESHOLD_SEC = 0.15;
 const SOFT_SYNC_THRESHOLD_SEC = 0.04;
-const HLS_RATE_CORRECTION_INTERVAL_MS = 250;
+const HLS_ALIGNMENT_THRESHOLD_SEC = HARD_SYNC_THRESHOLD_SEC;
+const HLS_MIN_ALIGNMENT_ALLOWANCE_SEC = 0.2;
+const HLS_MAX_INITIAL_ALIGNMENT_ALLOWANCE_SEC = 0.8;
+const HLS_MAX_REPEAT_ALIGNMENT_ALLOWANCE_SEC = 0.3;
+const HLS_MAX_TRACKED_ALIGNMENT_LATENCY_MS = 800;
+const HLS_MAX_ALIGNMENT_ATTEMPTS = 2;
+const HLS_ALIGNMENT_STABILITY_DELAY_MS = 250;
+const HLS_DRIFT_ALIGNMENT_THRESHOLD_SEC = 0.2;
+const HLS_DRIFT_STABILITY_DELAY_MS = PERIODIC_SYNC_INTERVAL_MS;
+const HLS_IMMEDIATE_REPEAT_PRIMARY_LATENCY_LIMIT_MS = 2_000;
+const HLS_STALLED_SEEK_RETRY_DELAY_MS = 4_000;
 const PLAYBACK_TELEMETRY_INTERVAL_MS = 500;
 const HLS_NETWORK_RECOVERY_DELAY_MS = 250;
 const HLS_NETWORK_RECOVERY_LIMIT = 3;
+const HLS_FRAGMENT_FIRST_BYTE_TIMEOUT_MS = 4_000;
 const Hls = window.Hls;
 const DIAGNOSTIC_STORAGE_KEY = "anytogether:sync-diagnostics";
 const MAX_DIAGNOSTIC_ENTRIES = 300;
@@ -36,9 +51,11 @@ const state = {
   connectionGeneration: 0,
   deferredHlsCorrection: null,
   hls: null,
+  hlsAlignmentLatencyMs: null,
   hlsBuffering: false,
+  hlsCommitLatencyMs: null,
   hlsCorrection: null,
-  hlsRateCorrectionTimer: null,
+  hlsPlayRequestAtMs: null,
   hlsRecoveryTimer: null,
   lastHlsRecoveryAt: 0,
   lastHlsLoadVersion: null,
@@ -138,7 +155,10 @@ function setPlaybackState() {
   if (!elements.player || !elements.playbackState) {
     return;
   }
-  elements.playbackState.textContent = elements.player.paused ? "Paused" : "Playing";
+  const paused = state.roomState?.media
+    ? state.roomState.playback.paused
+    : elements.player.paused;
+  elements.playbackState.textContent = paused ? "Paused" : "Playing";
 }
 
 function setPlaybackBlocked(blocked) {
@@ -190,12 +210,14 @@ function getPlaybackSyncInfo() {
   const buffering = Boolean(
     player &&
     roomState?.media &&
-    (state.hlsBuffering || player.seeking || (
+    (state.hlsBuffering || state.hlsCorrection?.awaitingPlayback ||
+      state.hlsCorrection?.pendingAlignment || player.seeking || (
       !roomState.playback.paused && player.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
     ))
   );
   return {
     active: Boolean(roomState?.media),
+    authoritativePaused: roomState?.playback?.paused ?? true,
     buffering,
     offsetMs: errorMs,
     playbackState: buffering ? "loading" : player?.paused ? "paused" : "playing",
@@ -430,32 +452,58 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
   const error = expectedPosition - player.currentTime;
   const absoluteError = Math.abs(error);
   state.lastSyncErrorMs = Math.round(absoluteError * 1_000);
-  if (reason !== "hls-rate-correction") {
-    storeDiagnostic({ type: "sync", reason, errorMs: state.lastSyncErrorMs, version: roomState.version });
-  }
+  storeDiagnostic({ type: "sync", reason, errorMs: state.lastSyncErrorMs, version: roomState.version });
 
   if (roomState.playback.paused) {
     if (!player.paused) {
       player.pause();
     }
     if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
-      setRemotePosition(player, expectedPosition, roomState);
-      startHlsLoadForState(roomState, expectedPosition);
+      const correctionPosition = setRemotePosition(player, expectedPosition, roomState);
+      startHlsLoadForState(roomState, correctionPosition);
     }
-    clearHlsRateCorrection(player);
+    resetHlsPlaybackRate(player);
   } else {
     if (state.playbackBlocked) {
-      clearHlsRateCorrection(player);
+      resetHlsPlaybackRate(player);
       setPlaybackState();
       return;
     }
-    const requiresHardCorrection = absoluteError > HARD_SYNC_THRESHOLD_SEC || player.paused;
+    const hasSettledCurrentHlsCorrection = roomState.media.kind === "hls" &&
+      state.hlsCorrection?.version === roomState.version &&
+      state.hlsCorrection.phase === "settled";
+    if (
+      hasSettledCurrentHlsCorrection &&
+      (state.hlsCorrection.alignmentAttempts >= HLS_MAX_ALIGNMENT_ATTEMPTS ||
+        absoluteError <= HLS_ALIGNMENT_THRESHOLD_SEC)
+    ) {
+      state.hlsCorrection.pendingAlignment = false;
+      state.hlsCorrection.alignmentReady = false;
+    }
+    if (shouldScheduleSettledHlsAlignment(
+      roomState,
+      state.hlsCorrection,
+      absoluteError,
+      HLS_DRIFT_ALIGNMENT_THRESHOLD_SEC,
+      HLS_MAX_ALIGNMENT_ATTEMPTS
+    )) {
+      scheduleHlsAlignment(state.hlsCorrection, false);
+    }
+    const withinHlsSettlementGrace = hasSettledCurrentHlsCorrection &&
+      !state.hlsCorrection.pendingAlignment &&
+      state.hlsCorrection.alignmentReady !== true &&
+      state.hlsCorrection.alignmentAttempts > 0 &&
+      performance.now() - state.hlsCorrection.settledAtMs < PERIODIC_SYNC_INTERVAL_MS;
+    const correctionThresholdSec = hasSettledCurrentHlsCorrection
+      ? HLS_ALIGNMENT_THRESHOLD_SEC
+      : HARD_SYNC_THRESHOLD_SEC;
+    const requiresPositionCorrection = !withinHlsSettlementGrace && absoluteError > correctionThresholdSec;
     const playerState = {
       buffering: state.hlsBuffering,
       seeking: player.seeking
     };
     if (
-      requiresHardCorrection &&
+      requiresPositionCorrection &&
       shouldQueueHlsCorrection(roomState, state.hlsCorrection, playerState)
     ) {
       if (state.deferredHlsCorrection?.version !== roomState.version) {
@@ -472,8 +520,18 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
       setPlaybackState();
       return;
     }
+    const hasPendingHlsStart = roomState.media.kind === "hls" &&
+      state.hlsCorrection?.version === roomState.version &&
+      state.hlsCorrection.awaitingPlayback;
+    if (hasPendingHlsStart) {
+      advanceHlsPlaybackStart(player);
+      player.playbackRate = 1;
+      requestAuthoritativePlayback(player);
+      setPlaybackState();
+      return;
+    }
     if (
-      requiresHardCorrection &&
+      requiresPositionCorrection &&
       shouldDeferHlsCorrection(roomState, state.hlsCorrection, playerState)
     ) {
       player.playbackRate = 1;
@@ -487,19 +545,33 @@ function synchronizePlayer(reason, serverTimeMs = estimateServerNow()) {
       setPlaybackState();
       return;
     }
-    const hasSettledHlsCorrection = roomState.media.kind === "hls" &&
-      state.hlsCorrection?.version === roomState.version &&
-      !state.hlsCorrection.awaitingPlayback;
-    if (hasSettledHlsCorrection) {
-      player.playbackRate = getHlsSyncPlaybackRate(error);
-      scheduleHlsRateCorrection(absoluteError);
-      requestAuthoritativePlayback(player);
-      setPlaybackState();
-      return;
-    }
-    if (requiresHardCorrection) {
-      setRemotePosition(player, expectedPosition, roomState);
-      startHlsLoadForState(roomState, expectedPosition);
+    if (requiresPositionCorrection) {
+      if (roomState.media.kind === "hls") {
+        const alignmentStarted = shouldRunSettledHlsAlignment(
+          roomState,
+          state.hlsCorrection,
+          playerState,
+          absoluteError,
+          HLS_ALIGNMENT_THRESHOLD_SEC,
+          HLS_MAX_ALIGNMENT_ATTEMPTS
+        ) && startHlsAlignment(
+          player,
+          roomState,
+          state.hlsCorrection,
+          expectedPosition,
+          error,
+          false
+        );
+        if (!alignmentStarted && shouldStartHlsPrimaryCorrection(roomState, state.hlsCorrection)) {
+          const correctionPosition = setRemotePosition(player, expectedPosition, roomState);
+          startHlsLoadForState(roomState, correctionPosition);
+        }
+      } else {
+        const correctionPosition = setRemotePosition(player, expectedPosition, roomState);
+        startHlsLoadForState(roomState, correctionPosition);
+      }
+    } else if (roomState.media.kind === "hls") {
+      player.playbackRate = 1;
     } else if (absoluteError > SOFT_SYNC_THRESHOLD_SEC) {
       player.playbackRate = error > 0 ? 1.04 : 0.96;
       resetPlaybackRate(player);
@@ -531,38 +603,257 @@ function resetPlaybackRate(player) {
   }, 1_600);
 }
 
-function markHlsCorrectionReady(player) {
+function markHlsCorrectionReady(player, playbackStarted = false) {
   const correction = state.hlsCorrection;
-  if (!correction || player.paused || player.seeking) {
+  if (!correction?.awaitingPlayback) {
     return;
   }
-  correction.awaitingPlayback = false;
-  scheduleHlsRateCorrection(Math.abs(getCurrentSyncErrorSec()));
+  advanceHlsPlaybackStart(player, playbackStarted);
+  if (
+    correction === state.hlsCorrection &&
+    correction.awaitingPlayback &&
+    correction.playbackStarted &&
+    !correction.stabilityCheckPending
+  ) {
+    correction.stabilityCheckPending = true;
+    window.setTimeout(() => {
+      correction.stabilityCheckPending = false;
+      if (correction === state.hlsCorrection && correction.awaitingPlayback) {
+        markHlsCorrectionReady(player);
+      }
+    }, 50);
+  }
 }
 
-function scheduleHlsRateCorrection(absoluteError) {
+function advanceHlsPlaybackStart(player, playbackStarted = false) {
+  const correction = state.hlsCorrection;
+  const roomState = state.roomState;
+  if (correction && playbackStarted) {
+    correction.playbackStarted = true;
+  }
+  if (correction?.awaitingPlayback && correction.version !== roomState?.version) {
+    if (player.seeking) {
+      return;
+    }
+    correction.awaitingPlayback = false;
+    correction.phase = "superseded";
+    state.hlsBuffering = false;
+    synchronizePlayer("queued-hls-correction");
+    return;
+  }
   if (
-    state.hlsRateCorrectionTimer !== null ||
-    absoluteError <= SOFT_SYNC_THRESHOLD_SEC ||
-    state.hlsCorrection?.version !== state.roomState?.version ||
-    state.roomState?.media?.kind !== "hls" ||
-    state.roomState.playback.paused ||
-    state.hlsCorrection.awaitingPlayback
+    !correction?.awaitingPlayback ||
+    roomState.media?.kind !== "hls" ||
+    roomState.playback.paused ||
+    player.readyState < HTMLMediaElement.HAVE_METADATA
   ) {
     return;
   }
-  state.hlsRateCorrectionTimer = window.setTimeout(() => {
-    state.hlsRateCorrectionTimer = null;
-    synchronizePlayer("hls-rate-correction");
-  }, HLS_RATE_CORRECTION_INTERVAL_MS);
+
+  if (player.seeking) {
+    retryBufferedHlsSeek(player, roomState, correction);
+    return;
+  }
+
+  if (
+    !["aligning", "committed"].includes(correction.phase) ||
+    !correction.playbackStarted ||
+    player.paused
+  ) {
+    return;
+  }
+
+  const completedAlignment = correction.phase === "aligning";
+  const commitLatencyMs = Math.max(0, performance.now() - correction.commitStartedAtMs);
+  if (completedAlignment) {
+    updateHlsAlignmentLatency(commitLatencyMs);
+    correction.lastAlignmentLatencyMs = commitLatencyMs;
+  } else {
+    updateHlsCommitLatency(commitLatencyMs);
+  }
+  state.hlsPlayRequestAtMs = null;
+  const settleLatencyMs = Math.max(0, performance.now() - correction.startedAtMs);
+  correction.awaitingPlayback = false;
+  correction.phase = "settled";
+  correction.settledAtMs = performance.now();
+  correction.commitLatencyMs = Math.round(commitLatencyMs);
+  correction.settleLatencyMs = Math.round(settleLatencyMs);
+  correction.startErrorMs = Math.round(Math.abs(getCurrentSyncErrorSec()) * 1_000);
+  const startErrorSec = correction.startErrorMs / 1_000;
+  correction.pendingAlignment = correction.alignmentAttempts < HLS_MAX_ALIGNMENT_ATTEMPTS && (
+    (!completedAlignment && startErrorSec > HLS_ALIGNMENT_THRESHOLD_SEC) ||
+    (completedAlignment &&
+      startErrorSec > HLS_DRIFT_ALIGNMENT_THRESHOLD_SEC &&
+      state.hlsCommitLatencyMs <= HLS_IMMEDIATE_REPEAT_PRIMARY_LATENCY_LIMIT_MS)
+  );
+  state.hlsBuffering = false;
+  player.playbackRate = 1;
+  storeDiagnostic({
+    type: "hls-seek-settled",
+    alignmentMs: Math.round((correction.alignmentAllowanceSec ?? 0) * 1_000),
+    errorMs: correction.startErrorMs,
+    commitLatencyMs: correction.commitLatencyMs,
+    leadMs: correction.leadMs,
+    settleLatencyMs: correction.settleLatencyMs,
+    version: correction.version
+  });
+
+  if (state.deferredHlsCorrection?.version === roomState.version) {
+    synchronizePlayer("queued-hls-correction");
+    return;
+  }
+  requestAuthoritativePlayback(player);
+  if (correction.pendingAlignment) {
+    scheduleHlsAlignment(correction);
+  }
+}
+
+function retryBufferedHlsSeek(player, roomState, correction) {
+  if (
+    correction.phase !== "committed" ||
+    correction.retryAttempts >= 1 ||
+    performance.now() - correction.startedAtMs < HLS_STALLED_SEEK_RETRY_DELAY_MS
+  ) {
+    return;
+  }
+  const expectedPosition = clampPosition(getPositionAt(roomState, estimateServerNow()), player.duration);
+  const retryPosition = getBufferedHlsAlignmentPosition(
+    expectedPosition,
+    expectedPosition,
+    getBufferedRanges(player)
+  );
+  if (retryPosition === null) {
+    return;
+  }
+
+  correction.retryAttempts += 1;
+  correction.commitTargetSec = retryPosition;
+  recordPlaybackEvent("sync-retry-seek", player);
+  player.currentTime = retryPosition;
+  state.hls?.startLoad(retryPosition);
+}
+
+function scheduleHlsAlignment(correction, requirePendingAlignment = true) {
+  if (correction.alignmentReadinessPending) {
+    return;
+  }
+  correction.alignmentReadinessPending = true;
+  const markReady = () => {
+    correction.alignmentReadinessPending = false;
+    if (
+      correction !== state.hlsCorrection ||
+      correction.phase !== "settled" ||
+      (requirePendingAlignment && !correction.pendingAlignment) ||
+      correction.alignmentAttempts >= HLS_MAX_ALIGNMENT_ATTEMPTS
+    ) {
+      return;
+    }
+    if (Math.abs(getCurrentSyncErrorSec()) <= HLS_ALIGNMENT_THRESHOLD_SEC) {
+      correction.pendingAlignment = false;
+      correction.alignmentReady = false;
+      return;
+    }
+    correction.alignmentReady = true;
+    synchronizePlayer("hls-alignment-ready");
+  };
+  window.setTimeout(
+    markReady,
+    requirePendingAlignment ? HLS_ALIGNMENT_STABILITY_DELAY_MS : HLS_DRIFT_STABILITY_DELAY_MS
+  );
+}
+
+function startHlsAlignment(
+  player,
+  roomState,
+  correction,
+  expectedPosition,
+  signedErrorSec,
+  markBuffering
+) {
+  if (
+    correction !== state.hlsCorrection ||
+    correction?.version !== roomState?.version ||
+    correction.alignmentAttempts >= HLS_MAX_ALIGNMENT_ATTEMPTS ||
+    Math.abs(signedErrorSec) <= HLS_ALIGNMENT_THRESHOLD_SEC
+  ) {
+    return false;
+  }
+
+  const wasSettled = correction.phase === "settled";
+  const alignmentAllowanceSec = getHlsAlignmentAllowanceSec(
+    {
+      alignmentAttempts: correction.alignmentAttempts,
+      historicAlignmentLatencyMs: state.hlsAlignmentLatencyMs,
+      primaryLatencyMs: state.hlsCommitLatencyMs
+    },
+    HLS_MIN_ALIGNMENT_ALLOWANCE_SEC,
+    HLS_MAX_INITIAL_ALIGNMENT_ALLOWANCE_SEC,
+    HLS_MAX_REPEAT_ALIGNMENT_ALLOWANCE_SEC
+  );
+  const desiredAlignmentPosition = clampPosition(expectedPosition + alignmentAllowanceSec, player.duration);
+  const alignmentPosition = getBufferedHlsAlignmentPosition(
+    expectedPosition,
+    desiredAlignmentPosition,
+    getBufferedRanges(player)
+  );
+  if (alignmentPosition === null) {
+    return false;
+  }
+
+  const startedAtMs = performance.now();
+  correction.alignmentAttempts += 1;
+  correction.alignmentReady = false;
+  correction.alignmentAllowanceSec = alignmentPosition - expectedPosition;
+  correction.awaitingPlayback = true;
+  correction.pendingAlignment = false;
+  correction.commitStartedAtMs = startedAtMs;
+  correction.commitTargetSec = alignmentPosition;
+  correction.phase = "aligning";
+  correction.playbackStarted = !player.paused;
+  if (wasSettled) {
+    correction.startedAtMs = startedAtMs;
+  }
+  if (markBuffering) {
+    state.hlsBuffering = true;
+  }
+  recordPlaybackEvent("sync-align-seek", player);
+  player.currentTime = alignmentPosition;
+  requestAuthoritativePlayback(player);
+  return true;
+}
+
+function updateHlsCommitLatency(commitLatencyMs) {
+  state.hlsCommitLatencyMs = commitLatencyMs;
+}
+
+function updateHlsAlignmentLatency(alignmentLatencyMs) {
+  if (
+    !Number.isFinite(alignmentLatencyMs) ||
+    alignmentLatencyMs > HLS_MAX_TRACKED_ALIGNMENT_LATENCY_MS
+  ) {
+    return;
+  }
+  state.hlsAlignmentLatencyMs = Number.isFinite(state.hlsAlignmentLatencyMs)
+    ? state.hlsAlignmentLatencyMs * 0.7 + alignmentLatencyMs * 0.3
+    : alignmentLatencyMs;
 }
 
 function requestAuthoritativePlayback(player) {
-  if (state.playbackBlocked || !player.paused || player.ended) {
+  if (
+    state.playbackBlocked ||
+    !player.paused ||
+    player.ended
+  ) {
     return;
   }
   state.remotePlayUntil = performance.now() + 10_000;
-  void player.play().catch(() => {
+  if (state.roomState?.media?.kind === "hls" && player.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
+    state.hlsPlayRequestAtMs = performance.now();
+  }
+  void player.play().catch((error) => {
+    if (error?.name === "AbortError") {
+      return;
+    }
     setPlaybackBlocked(true);
     state.remotePlayUntil = 0;
     logSyncEvent("Playback needs local activation", "Click the player once to allow audio playback.");
@@ -571,22 +862,41 @@ function requestAuthoritativePlayback(player) {
 
 function setRemotePosition(player, positionSec, roomState) {
   state.deferredHlsCorrection = null;
-  clearHlsRateCorrection(player);
+  state.hlsPlayRequestAtMs = null;
+  resetHlsPlaybackRate(player);
+  const isAdvancingHls = roomState.media?.kind === "hls" && !roomState.playback.paused;
+  const correctionPosition = clampPosition(positionSec, player.duration);
+  const startedAtMs = isAdvancingHls ? performance.now() : null;
   state.hlsCorrection = roomState.media?.kind === "hls"
     ? {
-        awaitingPlayback: !roomState.playback.paused,
+        awaitingPlayback: isAdvancingHls,
+        alignmentAttempts: 0,
+        commitStartedAtMs: startedAtMs,
+        commitTargetSec: correctionPosition,
+        leadMs: 0,
+        phase: isAdvancingHls ? "committed" : "settled",
+        playbackStarted: isAdvancingHls && !player.paused,
+        retryAttempts: 0,
+        settleLatencyMs: null,
+        startAllowanceSec: 0,
+        startedAtMs,
         version: roomState.version
       }
     : null;
+  state.hlsBuffering = isAdvancingHls;
   recordPlaybackEvent("sync-seek", player);
-  player.currentTime = positionSec;
+  player.currentTime = correctionPosition;
+  return correctionPosition;
 }
 
-function clearHlsRateCorrection(player = elements.player) {
-  if (state.hlsRateCorrectionTimer !== null) {
-    window.clearTimeout(state.hlsRateCorrectionTimer);
-    state.hlsRateCorrectionTimer = null;
-  }
+function getBufferedRanges(player) {
+  return Array.from({ length: player.buffered.length }, (_item, index) => ({
+    end: player.buffered.end(index),
+    start: player.buffered.start(index)
+  }));
+}
+
+function resetHlsPlaybackRate(player = elements.player) {
   if (player) {
     player.playbackRate = 1;
   }
@@ -601,12 +911,17 @@ function unloadSource(options = {}) {
     window.clearTimeout(state.hlsRecoveryTimer);
     state.hlsRecoveryTimer = null;
   }
-  clearHlsRateCorrection(player);
+  resetHlsPlaybackRate(player);
   state.hls?.destroy();
   state.deferredHlsCorrection = null;
   state.hls = null;
+  state.hlsAlignmentLatencyMs = null;
   state.hlsBuffering = false;
   state.hlsCorrection = null;
+  state.hlsPlayRequestAtMs = null;
+  if (!options.preserveNetworkRecovery) {
+    state.hlsCommitLatencyMs = null;
+  }
   state.lastHlsRecoveryAt = 0;
   state.lastHlsLoadVersion = null;
   state.sourceId = null;
@@ -644,7 +959,16 @@ function loadSource(media, options = {}) {
   }
 
   if (Hls.isSupported()) {
-    const hls = new Hls({ backBufferLength: 30, lowLatencyMode: false });
+    const hls = new Hls({
+      backBufferLength: 30,
+      fragLoadPolicy: {
+        default: {
+          ...Hls.DefaultConfig.fragLoadPolicy.default,
+          maxTimeToFirstByteMs: HLS_FRAGMENT_FIRST_BYTE_TIMEOUT_MS
+        }
+      },
+      lowLatencyMode: false
+    });
     state.hls = hls;
     hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
       if (data.details.live) {
@@ -654,6 +978,7 @@ function loadSource(media, options = {}) {
       }
     });
     hls.on(Hls.Events.FRAG_LOADED, (_event, data) => handleHlsFragmentLoaded(hls, data));
+    hls.on(Hls.Events.FRAG_BUFFERED, () => handleHlsFragmentBuffered(hls, player));
     hls.on(Hls.Events.ERROR, (_event, data) => handleHlsError(hls, data));
     hls.loadSource(media.url);
     hls.attachMedia(player);
@@ -692,14 +1017,29 @@ function handleHlsFragmentLoaded(hls, data) {
   }
   const stats = data.stats || data.frag?.stats;
   const loading = stats?.loading;
+  const loadMs = Number.isFinite(loading?.end) && Number.isFinite(loading?.start)
+    ? Math.max(0, loading.end - loading.start)
+    : null;
   storeDiagnostic({
     type: "hls-fragment-loaded",
     fragment: getHlsFragmentDiagnostic(data.frag),
     loadedBytes: stats?.loaded ?? null,
-    loadMs: Number.isFinite(loading?.end) && Number.isFinite(loading?.start)
-      ? Math.max(0, loading.end - loading.start)
-      : null
+    loadMs
   });
+}
+
+function handleHlsFragmentBuffered(hls, player) {
+  if (hls !== state.hls) {
+    return;
+  }
+  markHlsCorrectionReady(player);
+  if (
+    state.hlsCorrection?.phase === "settled" &&
+    state.hlsCorrection.version === state.roomState?.version &&
+    !state.roomState.playback.paused
+  ) {
+    synchronizePlayer("hls-fragment-buffered");
+  }
 }
 
 function handleHlsError(hls, data) {
@@ -814,11 +1154,13 @@ function scheduleHlsNetworkRecovery(hls) {
 function shouldRecoverHlsNetworkEarly(data) {
   const retryCount = data.errorAction?.retryCount ?? data.stats?.retry ?? 0;
   const responseCode = data.response?.code ?? 0;
-  return data.type === Hls.ErrorTypes.NETWORK_ERROR &&
-    !data.fatal &&
-    data.details === "fragLoadError" &&
-    retryCount >= 1 &&
-    responseCode >= 400;
+  if (data.type !== Hls.ErrorTypes.NETWORK_ERROR || data.fatal) {
+    return false;
+  }
+  if (data.details === "fragLoadTimeOut") {
+    return true;
+  }
+  return data.details === "fragLoadError" && retryCount >= 1 && responseCode >= 400;
 }
 
 function loadInterfaceMedia(url, forceReload = false) {
@@ -861,7 +1203,13 @@ function bindPlayerEvents() {
   });
   player.addEventListener("playing", () => {
     state.hlsBuffering = false;
-    markHlsCorrectionReady(player);
+    const hadPendingHlsCommit = state.hlsCorrection?.awaitingPlayback === true &&
+      ["aligning", "committed"].includes(state.hlsCorrection.phase);
+    markHlsCorrectionReady(player, true);
+    if (!hadPendingHlsCommit && Number.isFinite(state.hlsPlayRequestAtMs)) {
+      updateHlsCommitLatency(Math.max(0, performance.now() - state.hlsPlayRequestAtMs));
+      state.hlsPlayRequestAtMs = null;
+    }
     setPlaybackBlocked(false);
     state.remotePlayUntil = 0;
     recordPlaybackEvent("playing", player);
@@ -932,7 +1280,9 @@ window.anyTogetherSyncBridge = {
     return sendAction({ type: "pause" });
   },
   toggle() {
-    const intent = getPlaybackToggleIntent(state.roomState, elements.player?.paused !== false);
+    const correctionIsLoading = state.hlsCorrection?.awaitingPlayback === true;
+    const localPaused = elements.player?.paused !== false && !correctionIsLoading;
+    const intent = getPlaybackToggleIntent(state.roomState, localPaused);
     if (!intent) {
       return false;
     }
@@ -999,14 +1349,17 @@ window.__getPlaybackPipelineState = () => ({
     : [],
   connected: isSocketOpen(),
   hlsActive: Boolean(state.hls),
+  hlsAlignmentLatencyMs: state.hlsAlignmentLatencyMs,
   hlsBandwidthEstimate: state.hls?.bandwidthEstimate ?? null,
   hlsBuffering: state.hlsBuffering,
+  hlsCommitLatencyMs: state.hlsCommitLatencyMs,
   hlsCorrection: state.hlsCorrection ? { ...state.hlsCorrection } : null,
   hlsCurrentLevel: state.hls?.currentLevel ?? null,
   hlsLoadLevel: state.hls?.loadLevel ?? null,
   hlsNextLoadLevel: state.hls?.nextLoadLevel ?? null,
   localPositionSec: elements.player?.currentTime ?? null,
   localPaused: elements.player?.paused ?? true,
+  localPlaybackRate: elements.player?.playbackRate ?? 1,
   mediaUrl: state.roomState?.media?.url || "",
   networkState: elements.player?.networkState ?? null,
   paused: state.roomState?.playback?.paused ?? true,
@@ -1016,7 +1369,7 @@ window.__getPlaybackPipelineState = () => ({
   roomId: state.roomId,
   roundTripMs: state.roundTripMs,
   seeking: elements.player?.seeking ?? false,
-  syncErrorMs: state.lastSyncErrorMs,
+  syncErrorMs: Math.round(Math.abs(getCurrentSyncErrorSec()) * 1_000),
   clockOffsetMs: state.clockOffsetMs,
   version: state.roomState?.version ?? null
 });

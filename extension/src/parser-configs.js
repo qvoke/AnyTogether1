@@ -39,8 +39,7 @@ export async function getParserConfigs() {
   return loadParserConfigs();
 }
 
-export async function getParserConfigForUrl(pageUrl) {
-  const configs = await loadParserConfigs();
+export function selectParserConfig(configs, pageUrl) {
   const url = String(pageUrl || "");
   const matched = configs
     .filter((config) => {
@@ -53,6 +52,10 @@ export async function getParserConfigForUrl(pageUrl) {
     .sort((left, right) => (right.priority || 0) - (left.priority || 0));
 
   return matched[0] || configs.find((config) => config.id === "generic") || configs[0] || null;
+}
+
+export async function getParserConfigForUrl(pageUrl) {
+  return selectParserConfig(await loadParserConfigs(), pageUrl);
 }
 
 export const getParserProfileForUrl = getParserConfigForUrl;

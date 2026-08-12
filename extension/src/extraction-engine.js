@@ -1,4 +1,11 @@
 export function extractSeriesContextInPage(pageUrlArg, profileArg, htmlArg = null) {
+  if (pageUrlArg && typeof pageUrlArg === "object") {
+    const extractionArguments = pageUrlArg;
+    pageUrlArg = extractionArguments.pageUrl;
+    profileArg = extractionArguments.profile;
+    htmlArg = extractionArguments.html ?? null;
+  }
+
   const sourceDocument = (() => {
     if (typeof htmlArg !== "string" || !htmlArg.trim()) return document;
     const parsedDocument = document.implementation.createHTMLDocument("");

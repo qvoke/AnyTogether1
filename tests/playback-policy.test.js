@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  getBufferedHlsAlignmentPosition,
+  getHlsAlignmentAllowanceSec,
   getPlaybackToggleIntent,
-  getHlsSyncPlaybackRate,
   getRelativeSeekPosition,
   shouldDeferHlsCorrection,
-  shouldQueueHlsCorrection
+  shouldQueueHlsCorrection,
+  shouldRunSettledHlsAlignment,
+  shouldScheduleSettledHlsAlignment,
+  shouldStartHlsPrimaryCorrection
 } from "../public/playback-policy.js";
 
 test("relative seeks use the authoritative server-time position", () => {
@@ -41,17 +45,22 @@ test("a locally blocked participant activates playback without pausing the room"
   assert.equal(getPlaybackToggleIntent({ media: null, playback: { paused: true } }, true), null);
 });
 
-test("settled HLS playback converges without another media seek", () => {
-  assert.equal(getHlsSyncPlaybackRate(1.5), 2);
-  assert.equal(getHlsSyncPlaybackRate(-1.5), 0.5);
-  assert.equal(getHlsSyncPlaybackRate(0.7), 1.5);
-  assert.equal(getHlsSyncPlaybackRate(-0.7), 0.5);
-  assert.equal(getHlsSyncPlaybackRate(0.3), 1.3);
-  assert.equal(getHlsSyncPlaybackRate(-0.3), 0.7);
-  assert.equal(getHlsSyncPlaybackRate(0.1), 1.15);
-  assert.equal(getHlsSyncPlaybackRate(-0.1), 0.85);
-  assert.equal(getHlsSyncPlaybackRate(0.04), 1);
-  assert.equal(getHlsSyncPlaybackRate(Number.NaN), 1);
+test("HLS alignment predicts a bounded buffered seek latency", () => {
+  assert.equal(getHlsAlignmentAllowanceSec({ primaryLatencyMs: 1_600 }), 0.8);
+  assert.equal(getHlsAlignmentAllowanceSec({ primaryLatencyMs: 600 }), 0.3);
+  assert.equal(getHlsAlignmentAllowanceSec({ historicAlignmentLatencyMs: 250, primaryLatencyMs: 1_600 }), 0.25);
+  assert.equal(getHlsAlignmentAllowanceSec({ alignmentAttempts: 1, historicAlignmentLatencyMs: 600 }), 0.3);
+  assert.equal(getHlsAlignmentAllowanceSec(null), 0.2);
+});
+
+test("HLS alignment stays inside the available buffered range", () => {
+  const bufferedRanges = [{ start: 340, end: 350 }];
+
+  assert.equal(getBufferedHlsAlignmentPosition(349.8, 350.2, bufferedRanges), null);
+  assert.equal(getBufferedHlsAlignmentPosition(348, 348.3, bufferedRanges), 348.3);
+  assert.equal(getBufferedHlsAlignmentPosition(349.8, 349.95, bufferedRanges), null);
+  assert.equal(getBufferedHlsAlignmentPosition(350, 350.2, bufferedRanges), null);
+  assert.equal(getBufferedHlsAlignmentPosition(330, 330.2, bufferedRanges), null);
 });
 
 test("HLS correction waits for stable playback after a remote seek", () => {
@@ -126,6 +135,90 @@ test("a newer HLS seek is queued while the previous correction is unstable", () 
       previousCorrection,
       { buffering: true, seeking: true }
     ),
+    false
+  );
+});
+
+test("a settled HLS version allows bounded alignment without repeating its primary seek", () => {
+  const roomState = {
+    media: { id: "media-1", kind: "hls" },
+    playback: { paused: false },
+    version: 7
+  };
+  const correction = {
+    alignmentReady: true,
+    alignmentAttempts: 0,
+    awaitingPlayback: false,
+    phase: "settled",
+    version: 7
+  };
+  const stablePlayer = { buffering: false, seeking: false };
+
+  assert.equal(shouldStartHlsPrimaryCorrection(roomState, correction), false);
+  assert.equal(shouldRunSettledHlsAlignment(roomState, correction, stablePlayer, 0.28), true);
+  assert.equal(shouldRunSettledHlsAlignment(roomState, correction, stablePlayer, 0.15), false);
+  assert.equal(
+    shouldRunSettledHlsAlignment(
+      roomState,
+      { ...correction, alignmentReady: false },
+      stablePlayer,
+      0.28
+    ),
+    false
+  );
+  assert.equal(
+    shouldRunSettledHlsAlignment(
+      roomState,
+      { ...correction, alignmentAttempts: 2 },
+      stablePlayer,
+      0.28
+    ),
+    false
+  );
+  assert.equal(
+    shouldRunSettledHlsAlignment(
+      roomState,
+      { ...correction, alignmentAttempts: 1 },
+      stablePlayer,
+      0.28
+    ),
+    true
+  );
+  assert.equal(
+    shouldRunSettledHlsAlignment(roomState, correction, { buffering: true, seeking: false }, 0.28),
+    false
+  );
+  assert.equal(shouldStartHlsPrimaryCorrection({ ...roomState, version: 8 }, correction), true);
+});
+
+test("settled HLS playback rearms alignment only for persistent uncorrected drift", () => {
+  const roomState = {
+    media: { id: "media-1", kind: "hls" },
+    playback: { paused: false },
+    version: 7
+  };
+  const correction = {
+    alignmentReady: false,
+    alignmentReadinessPending: false,
+    alignmentAttempts: 1,
+    awaitingPlayback: false,
+    pendingAlignment: false,
+    phase: "settled",
+    version: 7
+  };
+
+  assert.equal(shouldScheduleSettledHlsAlignment(roomState, correction, 0.28), true);
+  assert.equal(shouldScheduleSettledHlsAlignment(roomState, correction, 0.15), false);
+  assert.equal(
+    shouldScheduleSettledHlsAlignment(roomState, { ...correction, alignmentReadinessPending: true }, 0.28),
+    false
+  );
+  assert.equal(
+    shouldScheduleSettledHlsAlignment(roomState, { ...correction, alignmentReady: true }, 0.28),
+    false
+  );
+  assert.equal(
+    shouldScheduleSettledHlsAlignment(roomState, { ...correction, alignmentAttempts: 2 }, 0.28),
     false
   );
 });

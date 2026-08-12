@@ -10,7 +10,7 @@
     "test": "npm run test:sync && npm run test:playback && npm run test:extension && npm run test:worker && npm run validate:configs",
     "test:sync": "node --import tsx --test tests/sync-protocol.test.ts",
     "test:playback": "node --test tests/playback-policy.test.js",
-    "test:extension": "node --test tests/extension-bridge.test.js",
+    "test:extension": "node --test tests/extension-bridge.test.js tests/direct-resolver.test.js",
     "test:worker": "npm run build && node --import tsx --test tests/worker-room.test.ts tests/worker-api.test.ts",
     "test:e2e": "playwright test",
     "test:e2e:watch": "playwright test --headed --workers=1",

@@ -1,7 +1,7 @@
 const REPORT_STORAGE_KEY = "anytogether:manual-diagnostics";
 const SAMPLE_INTERVAL_MS = 1_000;
 const MAX_ITEMS = 1_000;
-const REPORT_VERSION = 3;
+const REPORT_VERSION = 6;
 const OMITTED_DIAGNOSTIC_TYPES = new Set(["clock", "delivery", "sync"]);
 const SAMPLE_FIELDS = [
   "elapsedMs",
@@ -18,7 +18,14 @@ const SAMPLE_FIELDS = [
   "nextLoadLevel",
   "bandwidthKbps",
   "roundTripMs",
-  "clockOffsetMs"
+  "clockOffsetMs",
+  "playbackRatePermille",
+  "correctionPhase",
+  "preloadLeadMs",
+  "startAllowanceMs",
+  "commitLatencyMs",
+  "seekSettleMs",
+  "startErrorMs"
 ];
 const SAMPLE_FLAGS = {
   authoritativePaused: 1,
@@ -186,13 +193,25 @@ if (import.meta.env.DEV) {
           : null
       };
     }
-    if (item.type === "hls-fragment-loaded") {
+    if (item.type === "hls-fragment-loaded" || item.type === "hls-fragment-prefetched") {
       return {
         t: time,
-        type: "hls-loaded",
+        type: item.type === "hls-fragment-prefetched" ? "hls-prefetched" : "hls-loaded",
         fragment: fragmentIdentity(item.fragment),
         loadedBytes: integer(item.loadedBytes),
         loadMs: integer(item.loadMs)
+      };
+    }
+    if (item.type === "hls-seek-settled") {
+      return {
+        t: time,
+        type: "hls-settled",
+        alignmentMs: item.alignmentMs,
+        errorMs: item.errorMs,
+        commitMs: item.commitLatencyMs,
+        leadMs: item.leadMs,
+        settleMs: item.settleLatencyMs,
+        version: item.version
       };
     }
     if (item.type === "event" && /activation|error|failed|recover|restart|unsupported/i.test(item.title || "")) {
@@ -286,7 +305,14 @@ if (import.meta.env.DEV) {
         pipeline.hlsNextLoadLevel,
         integer(pipeline.hlsBandwidthEstimate, 1_000),
         integer(pipeline.roundTripMs),
-        integer(pipeline.clockOffsetMs)
+        integer(pipeline.clockOffsetMs),
+        integer(pipeline.localPlaybackRate, 0.001),
+        pipeline.hlsCorrection?.phase ?? null,
+        integer(pipeline.hlsCorrection?.leadMs),
+        integer(pipeline.hlsCorrection?.startAllowanceSec, 0.001),
+        integer(pipeline.hlsCorrection?.commitLatencyMs),
+        integer(pipeline.hlsCorrection?.settleLatencyMs),
+        integer(pipeline.hlsCorrection?.startErrorMs)
       ]);
       const ranges = (pipeline.bufferedRanges || []).flatMap((range) => [
         positionMs(range.start),
