@@ -1,7 +1,7 @@
 const REPORT_STORAGE_KEY = "anytogether:manual-diagnostics";
 const SAMPLE_INTERVAL_MS = 1_000;
 const MAX_ITEMS = 1_000;
-const REPORT_VERSION = 6;
+const REPORT_VERSION = 7;
 const OMITTED_DIAGNOSTIC_TYPES = new Set(["clock", "delivery", "sync"]);
 const SAMPLE_FIELDS = [
   "elapsedMs",
@@ -12,27 +12,19 @@ const SAMPLE_FIELDS = [
   "readyState",
   "networkState",
   "flags",
-  "correctionVersion",
   "currentLevel",
   "loadLevel",
   "nextLoadLevel",
   "bandwidthKbps",
   "roundTripMs",
   "clockOffsetMs",
-  "playbackRatePermille",
-  "correctionPhase",
-  "preloadLeadMs",
-  "startAllowanceMs",
-  "commitLatencyMs",
-  "seekSettleMs",
-  "startErrorMs"
+  "playbackRatePermille"
 ];
 const SAMPLE_FLAGS = {
   authoritativePaused: 1,
   localPaused: 2,
   seeking: 4,
-  hlsBuffering: 8,
-  awaitingPlayback: 16
+  hlsBuffering: 8
 };
 const PLAYBACK_EVENT_FIELDS = ["elapsedMs", "type", "positionMs", "readyState", "flags"];
 const PLAYBACK_EVENT_FLAGS = { paused: 1, muted: 2 };
@@ -162,15 +154,6 @@ if (import.meta.env.DEV) {
     if (item.type === "action-sent") {
       return { t: time, type: "action", action: item.actionType, version: item.knownVersion };
     }
-    if (item.type === "hls-correction-deferred" || item.type === "hls-correction-queued") {
-      return {
-        t: time,
-        type: item.type === "hls-correction-queued" ? "queue" : "defer",
-        reason: item.reason,
-        errorMs: item.errorMs,
-        version: item.version
-      };
-    }
     if (item.type === "hls-error") {
       return {
         t: time,
@@ -193,25 +176,13 @@ if (import.meta.env.DEV) {
           : null
       };
     }
-    if (item.type === "hls-fragment-loaded" || item.type === "hls-fragment-prefetched") {
+    if (item.type === "hls-fragment-loaded") {
       return {
         t: time,
-        type: item.type === "hls-fragment-prefetched" ? "hls-prefetched" : "hls-loaded",
+        type: "hls-loaded",
         fragment: fragmentIdentity(item.fragment),
         loadedBytes: integer(item.loadedBytes),
         loadMs: integer(item.loadMs)
-      };
-    }
-    if (item.type === "hls-seek-settled") {
-      return {
-        t: time,
-        type: "hls-settled",
-        alignmentMs: item.alignmentMs,
-        errorMs: item.errorMs,
-        commitMs: item.commitLatencyMs,
-        leadMs: item.leadMs,
-        settleMs: item.settleLatencyMs,
-        version: item.version
       };
     }
     if (item.type === "event" && /activation|error|failed|recover|restart|unsupported/i.test(item.title || "")) {
@@ -281,8 +252,7 @@ if (import.meta.env.DEV) {
     return (pipeline.paused ? SAMPLE_FLAGS.authoritativePaused : 0) |
       (pipeline.localPaused ? SAMPLE_FLAGS.localPaused : 0) |
       (pipeline.seeking ? SAMPLE_FLAGS.seeking : 0) |
-      (pipeline.hlsBuffering ? SAMPLE_FLAGS.hlsBuffering : 0) |
-      (pipeline.hlsCorrection?.awaitingPlayback ? SAMPLE_FLAGS.awaitingPlayback : 0);
+      (pipeline.hlsBuffering ? SAMPLE_FLAGS.hlsBuffering : 0);
   }
 
   function collectSample() {
@@ -299,20 +269,13 @@ if (import.meta.env.DEV) {
         pipeline.readyState,
         pipeline.networkState,
         sampleFlags(pipeline),
-        pipeline.hlsCorrection?.version ?? null,
         pipeline.hlsCurrentLevel,
         pipeline.hlsLoadLevel,
         pipeline.hlsNextLoadLevel,
         integer(pipeline.hlsBandwidthEstimate, 1_000),
         integer(pipeline.roundTripMs),
         integer(pipeline.clockOffsetMs),
-        integer(pipeline.localPlaybackRate, 0.001),
-        pipeline.hlsCorrection?.phase ?? null,
-        integer(pipeline.hlsCorrection?.leadMs),
-        integer(pipeline.hlsCorrection?.startAllowanceSec, 0.001),
-        integer(pipeline.hlsCorrection?.commitLatencyMs),
-        integer(pipeline.hlsCorrection?.settleLatencyMs),
-        integer(pipeline.hlsCorrection?.startErrorMs)
+        integer(pipeline.localPlaybackRate, 0.001)
       ]);
       const ranges = (pipeline.bufferedRanges || []).flatMap((range) => [
         positionMs(range.start),

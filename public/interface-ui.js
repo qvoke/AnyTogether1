@@ -4091,11 +4091,6 @@ function updateRoomFromMediaPayload(roomId, payload, shouldBroadcast) {
   } else if (!roomState.ui) {
     roomState.ui = createDefaultUi(nextSeriesContext);
   }
-  roomState.currentPlayback = {
-    state: "paused",
-    time: 0,
-    updatedAt: Date.now()
-  };
   sanitizeRoomUi(roomState);
 
   const pendingEpisode = getPendingEpisodeSelection(roomState);
@@ -4145,7 +4140,6 @@ function updateRoomFromMediaPayload(roomId, payload, shouldBroadcast) {
 
   if (state.activeRoomId === normalized && shouldReloadPlayer) {
     refreshActiveRoom();
-    syncActiveRoomMedia(true);
   }
 }
 
@@ -4676,7 +4670,6 @@ function connectWs() {
         lastSyncMediaKey = "";
         syncMediaBlockUntil = 0;
         refreshActiveRoom();
-        syncActiveRoomMedia(true);
       }
       return;
     }

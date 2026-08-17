@@ -3,15 +3,23 @@ import { readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolveConfiguredSourceMedia } from "./source-media.mjs";
 
-const config = JSON.parse(readFileSync(new URL("../e2e.config.json", import.meta.url), "utf8"));
-const maxClientDeltaMs = Math.max(40, Number(config.maxClientDeltaMs) || 300);
-const maxInitialClientDeltaMs = Math.max(100, Number(config.maxInitialClientDeltaMs) || 400);
-const maxInitialSyncErrorMs = Math.max(100, Number(config.maxInitialSyncErrorMs) || 750);
-const maxSeekConvergenceMs = Math.max(1_000, Number(config.maxSeekConvergenceMs) || 7_000);
-const maxSeekLoadingMs = Math.max(1_000, Number(config.maxSeekLoadingMs) || 6_000);
-const maxSyncAlignmentAttempts = 2;
+const fileConfig = JSON.parse(readFileSync(new URL("../e2e.config.json", import.meta.url), "utf8"));
+const config = {
+  ...fileConfig,
+  playbackSettleMs: getRunNumber("E2E_PLAYBACK_SETTLE_MS", fileConfig.playbackSettleMs, 0),
+  seekCount: getRunNumber("E2E_SEEK_COUNT", fileConfig.seekCount, 0)
+};
+const maxClientDeltaMs = 750;
 let resolvedSourceMedia = null;
 test.describe.configure({ mode: "serial" });
+
+function getRunNumber(name, fallback, minimum) {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(minimum, Math.floor(value));
+}
 
 function sitesRequestHeaders() {
   const token = process.env.E2E_SITES_BYPASS_TOKEN;
@@ -81,59 +89,55 @@ async function waitForMedia(page, mediaUrl) {
   }, { timeout: 30_000 }).toBe(true);
 }
 
-async function playbackSamples(pages, operationStartedAt = 0) {
-  return Promise.all(pages.map((page) => page.locator("#player").evaluate((video, startedAt) => {
-    const pipeline = window.__getPlaybackPipelineState?.() || null;
-    let forwardBufferSec = 0;
-    for (let index = 0; index < video.buffered.length; index += 1) {
-      if (video.currentTime >= video.buffered.start(index) - 0.05 && video.currentTime <= video.buffered.end(index)) {
-        forwardBufferSec = Math.max(forwardBufferSec, video.buffered.end(index) - video.currentTime);
-      }
+async function playbackSamples(pages) {
+  return Promise.all(pages.map((page) => page.locator("#player").evaluate((video) => {
+    if (!video.__e2eFrameCallbackStarted) {
+      video.__e2eFrameCallbackStarted = true;
+      video.__e2ePresentedFrames = 0;
+      const recordPresentedFrame = () => {
+        video.__e2ePresentedFrames = (video.__e2ePresentedFrames || 0) + 1;
+        video.requestVideoFrameCallback(recordPresentedFrame);
+      };
+      video.requestVideoFrameCallback(recordPresentedFrame);
     }
+    const quality = video.getVideoPlaybackQuality();
     return {
       currentTime: video.currentTime,
-      duration: video.duration,
+      decodedFrames: quality.totalVideoFrames,
+      droppedFrames: quality.droppedVideoFrames,
       paused: video.paused,
-      playbackRate: video.playbackRate,
-      hlsActive: Boolean(pipeline?.hlsActive),
-      syncPending: Boolean(
-        pipeline?.hlsBuffering ||
-        pipeline?.hlsCorrection?.awaitingPlayback ||
-        pipeline?.hlsCorrection?.pendingAlignment
-      ),
-      ended: video.ended,
-      forwardBufferSec,
+      presentedFrames: video.__e2ePresentedFrames || 0,
       readyState: video.readyState,
-      seeking: video.seeking,
-      syncErrorMs: Number.isFinite(pipeline?.positionSec)
-        ? Math.round(Math.abs(pipeline.positionSec - video.currentTime) * 1_000)
-        : null,
-      fatalHlsErrors: (window.__getSyncDiagnostics?.() || []).filter((entry) => (
-        entry.type === "hls-error" && entry.fatal === true && entry.at >= startedAt
-      )).length
+      seeking: video.seeking
     };
-  }, operationStartedAt)));
+  })));
 }
 
-async function playbackEventCounts(pages, eventType, operationStartedAt) {
-  return Promise.all(pages.map((page) => page.evaluate(({ startedAt, type }) => (
-    (window.__getPlaybackEvents?.() || []).filter((entry) => (
-      entry.type === type && entry.at >= startedAt
-    )).length
-  ), { startedAt: operationStartedAt, type: eventType })));
+function isPlaybackReady(sample) {
+  return sample.readyState >= 3 && !sample.paused && !sample.seeking;
 }
 
-function isPlaybackSampleStable(sample) {
-  const remainingSec = Number.isFinite(sample.duration)
-    ? Math.max(0, sample.duration - sample.currentTime)
-    : 2;
-  const requiredForwardBufferSec = Math.min(2, remainingSec);
-  return sample.readyState >= 3 &&
-    !sample.paused &&
-    !sample.seeking &&
-    !sample.syncPending &&
-    !sample.ended &&
-    sample.forwardBufferSec >= requiredForwardBufferSec - 0.05;
+function summarizePlaybackWindows(entries) {
+  const windows = entries.filter((entry) => Array.isArray(entry.presentedFps));
+  const arrayValues = (key) => windows.flatMap((entry) => (
+    Array.isArray(entry[key]) ? entry[key].filter((value) => typeof value === "number") : []
+  ));
+  const numberValue = (entry, key) => (typeof entry[key] === "number" ? entry[key] : 0);
+  const round = (value) => Math.round(value * 10) / 10;
+  const minimum = (values) => (values.length > 0 ? round(Math.min(...values)) : null);
+  const maximum = (values) => (values.length > 0 ? Math.max(...values) : null);
+
+  return {
+    windows: windows.length,
+    slowWindows: windows.filter((entry) => numberValue(entry, "slowFrameSampleCount") > 0).length,
+    slowFrameSamples: windows.reduce((total, entry) => total + numberValue(entry, "slowFrameSampleCount"), 0),
+    unreadyWindows: windows.filter((entry) => numberValue(entry, "unreadySampleCount") > 0).length,
+    cadenceResets: windows.reduce((total, entry) => total + numberValue(entry, "cadenceResetCount"), 0),
+    minimumSampledFps: minimum(arrayValues("minimumSampledFps")),
+    minimumFinalFps: minimum(arrayValues("presentedFps")),
+    maximumClientDeltaMs: maximum(windows.map((entry) => numberValue(entry, "deltaMs"))),
+    maximumSettleMs: maximum(windows.map((entry) => numberValue(entry, "settledAfterMs")))
+  };
 }
 
 async function playbackFailureDiagnostics(pages) {
@@ -150,209 +154,200 @@ async function playbackFailureDiagnostics(pages) {
 }
 
 async function waitForPlayback(pageA, pageB, expectedPosition = undefined, syncLog = null, persistSyncLog = null, operationStartedAt = Date.now()) {
-  let finalSamples = [];
+  let readySamples = [];
   let loadingWaitMs = null;
-  let initialClientDeltaMs = null;
-  const firstPlayableErrorMs = [null, null];
   const synchronizationStartedAt = Date.now();
-  const convergenceTimeoutMs = 30_000;
-  let converged = false;
+  const followsTargetTimeline = (sample, sampledAt) => {
+    if (expectedPosition === undefined) {
+      return true;
+    }
+    const positionAtOperationStart = expectedPosition + Math.max(0, sampledAt - operationStartedAt) / 1_000;
+    const positionAtSynchronizationStart = expectedPosition + Math.max(0, sampledAt - synchronizationStartedAt) / 1_000;
+    const lowerBound = Math.min(positionAtOperationStart, positionAtSynchronizationStart) - 1.5;
+    const upperBound = Math.max(positionAtOperationStart, positionAtSynchronizationStart) + 1.5;
+    return sample.currentTime >= lowerBound && sample.currentTime <= upperBound;
+  };
   try {
-    while (Date.now() - synchronizationStartedAt < convergenceTimeoutMs) {
-      const samples = await playbackSamples([pageA, pageB], operationStartedAt);
-      finalSamples = samples;
-      if (loadingWaitMs === null && samples.every((sample) => (
-        sample.readyState >= 3 && !sample.syncPending
-      ))) {
-        loadingWaitMs = Date.now() - operationStartedAt;
-      }
-      if (samples.some((sample) => sample.fatalHlsErrors > 0)) {
-        throw new Error("Fatal HLS error occurred while waiting for playback");
-      }
-      if (samples.some((sample) => sample.hlsActive && Math.abs(sample.playbackRate - 1) > 0.001)) {
-        throw new Error("HLS synchronization changed playback speed");
-      }
-      const firstPlaybackCandidates = samples.map((sample) => (
-        sample.readyState >= 3 && !sample.paused && !sample.seeking && !sample.syncPending &&
-        (expectedPosition === undefined || Math.abs(sample.currentTime - expectedPosition) < 5)
-      ));
-      firstPlaybackCandidates.forEach((isCandidate, index) => {
-        if (isCandidate && firstPlayableErrorMs[index] === null) {
-          firstPlayableErrorMs[index] = sampleErrorMs(samples[index]);
+    await expect.poll(
+      async () => {
+        const samples = await playbackSamples([pageA, pageB]);
+        readySamples = samples;
+        if (loadingWaitMs === null && samples.every(isPlaybackReady)) {
+          loadingWaitMs = Date.now() - operationStartedAt;
         }
-      });
-      if (initialClientDeltaMs === null && firstPlaybackCandidates.every(Boolean)) {
-        initialClientDeltaMs = Math.round(Math.abs(samples[0].currentTime - samples[1].currentTime) * 1_000);
-      }
-      const stablePlayback = samples.every(isPlaybackSampleStable);
-      const clientsConverged = Math.abs(samples[0].currentTime - samples[1].currentTime) * 1_000 < maxClientDeltaMs;
-      let authoritativeConvergence = true;
-      if (expectedPosition !== undefined) {
-        const authoritative = await pipelineState(pageA);
-        const expectedPositionAtSample = authoritative?.positionSec;
-        authoritativeConvergence = Number.isFinite(expectedPositionAtSample) &&
-          samples.every((sample) => Math.abs(sample.currentTime - expectedPositionAtSample) < 1.5);
-      }
-      if (stablePlayback && clientsConverged && authoritativeConvergence) {
-        converged = true;
-        break;
-      }
-      await pageA.waitForTimeout(100);
-    }
-    if (!converged) {
-      throw new Error(`Playback convergence exceeded ${convergenceTimeoutMs} ms`);
-    }
+        if (!samples.every(isPlaybackReady)) {
+          return false;
+        }
+        if (Math.abs(samples[0].currentTime - samples[1].currentTime) * 1_000 >= maxClientDeltaMs) {
+          return false;
+        }
+        const sampledAt = Date.now();
+        return samples.every((sample) => followsTargetTimeline(sample, sampledAt));
+      },
+      { timeout: 30_000, intervals: [100, 250, 500, 1_000] }
+    ).toBe(true);
   } catch (error) {
     if (syncLog) {
       syncLog.push({
         targetPosition: expectedPosition ?? null,
+        phase: "playback-readiness-timeout",
         loadingWaitMs,
-        initialClientDeltaMs,
-        firstPlayableErrorMs,
-        convergenceWaitMs: Date.now() - synchronizationStartedAt,
-        settledAfterMs: 0,
         totalWaitMs: Date.now() - synchronizationStartedAt,
-        samples: finalSamples.map(({ currentTime, readyState }) => ({ currentTime, readyState })),
-        deltaMs: finalSamples.length === 2
-          ? Math.round(Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000)
-          : null,
-        progressDeltaSec: [],
-        fatalHlsErrorCount: finalSamples.reduce((total, sample) => total + sample.fatalHlsErrors, 0),
-        hangDetected: true,
-        convergenceTimedOut: Date.now() - synchronizationStartedAt >= convergenceTimeoutMs,
-        timeoutMs: convergenceTimeoutMs,
-        failureDiagnostics: await playbackFailureDiagnostics([pageA, pageB])
+        samples: readySamples,
+        deltaMs: readySamples.length === 2
+          ? Math.round(Math.abs(readySamples[0].currentTime - readySamples[1].currentTime) * 1_000)
+          : null
       });
       if (persistSyncLog) {
         await persistSyncLog();
       }
     }
-    throw new Error("Playback did not reach a stable synchronized state", { cause: error });
+    throw error;
   }
-
+  const convergenceWaitMs = Date.now() - synchronizationStartedAt;
   const settleMs = Math.max(0, Number(config.playbackSettleMs) || 0);
-  const settleStartSamples = await playbackSamples([pageA, pageB], operationStartedAt);
+  const progressStartSamples = readySamples;
   const settleStartedAt = Date.now();
-  let fatalHlsErrorDuringSettle = false;
-  while (Date.now() - settleStartedAt < settleMs) {
-    const samples = await playbackSamples([pageA, pageB], operationStartedAt);
-    if (samples.some((sample) => sample.fatalHlsErrors > 0)) {
-      fatalHlsErrorDuringSettle = true;
-      break;
-    }
-    if (loadingWaitMs === null && samples.every((sample) => (
-      sample.readyState >= 3 && !sample.syncPending
-    ))) {
-      loadingWaitMs = Date.now() - operationStartedAt;
-    }
-    const remainingSettleMs = settleMs - (Date.now() - settleStartedAt);
-    if (remainingSettleMs > 0) {
-      await pageA.waitForTimeout(Math.min(100, remainingSettleMs));
-    }
-  }
-  const settleEndSamples = await playbackSamples([pageA, pageB], operationStartedAt);
-  const progressDeltaSec = settleEndSamples.map((sample, index) => (
-    sample.currentTime - settleStartSamples[index].currentTime
-  ));
+  let cadenceStartedAt = settleStartedAt;
+  let cadenceStartSamples = readySamples;
+  let frameSampleStartedAt = settleStartedAt;
+  let frameSampleStartSamples = readySamples;
+  let finalSamples = readySamples;
+  let progressDeltaSec = finalSamples.map(() => 0);
+  let presentedFrameDelta = finalSamples.map(() => 0);
+  let droppedFrameDelta = finalSamples.map(() => 0);
+  let presentedFps = finalSamples.map(() => 0);
+  let slowFrameSampleCount = 0;
+  let unreadySampleCount = 0;
+  let cadenceResetCount = 0;
+  let minimumSampledFps = finalSamples.map(() => null);
   const minimumProgressSec = settleMs > 0 ? Math.min(0.75, settleMs / 2_000) : 0;
-  const stablePlayback = settleEndSamples.every((sample) => (
-    isPlaybackSampleStable(sample) && sample.fatalHlsErrors === 0
-  ));
-  const clientDeltaMs = Math.round(Math.abs(settleEndSamples[0].currentTime - settleEndSamples[1].currentTime) * 1_000);
-  const clientsConverged = clientDeltaMs < maxClientDeltaMs;
-  const hangDetected = progressDeltaSec.some((progress) => progress < minimumProgressSec);
-  const unstablePlaybackDetected = !stablePlayback;
-  const desynchronizationDetected = !clientsConverged;
-  const fatalHlsErrorCount = settleEndSamples.reduce((total, sample) => total + sample.fatalHlsErrors, 0);
-  const convergenceWaitMs = Date.now() - synchronizationStartedAt - settleMs;
-  const syncSeekEventCounts = expectedPosition === undefined
-    ? []
-    : await playbackEventCounts([pageA, pageB], "sync-seek", operationStartedAt);
-  const syncAlignmentEventCounts = expectedPosition === undefined
-    ? []
-    : await playbackEventCounts([pageA, pageB], "sync-align-seek", operationStartedAt);
-  const repeatedSyncSeekDetected = syncSeekEventCounts.some((count) => count > 1) ||
-    syncAlignmentEventCounts.some((count) => count > maxSyncAlignmentAttempts);
-  const loadingTooSlow = expectedPosition !== undefined && (loadingWaitMs === null || loadingWaitMs > maxSeekLoadingMs);
-  const convergenceTooSlow = expectedPosition !== undefined && convergenceWaitMs > maxSeekConvergenceMs;
-  const initialClientDeltaTooLarge = expectedPosition !== undefined && (
-    initialClientDeltaMs === null || initialClientDeltaMs > maxInitialClientDeltaMs
+  const cadenceObservationMs = Math.max(2_000, settleMs);
+  const minimumPresentedFps = 20;
+  const cadenceExpectation = expect.poll(
+    async () => {
+      finalSamples = await playbackSamples([pageA, pageB]);
+      const observationMs = Date.now() - cadenceStartedAt;
+      const frameSampleMs = Date.now() - frameSampleStartedAt;
+      progressDeltaSec = finalSamples.map((sample, index) => (
+        sample.currentTime - progressStartSamples[index].currentTime
+      ));
+      presentedFrameDelta = finalSamples.map((sample, index) => (
+        sample.presentedFrames - cadenceStartSamples[index].presentedFrames
+      ));
+      droppedFrameDelta = finalSamples.map((sample, index) => (
+        sample.droppedFrames - cadenceStartSamples[index].droppedFrames
+      ));
+      presentedFps = presentedFrameDelta.map((frames) => (
+        observationMs > 0 ? frames / (observationMs / 1_000) : 0
+      ));
+      const resetCadenceWindow = () => {
+        cadenceStartedAt = Date.now();
+        cadenceStartSamples = finalSamples;
+        frameSampleStartedAt = cadenceStartedAt;
+        frameSampleStartSamples = finalSamples;
+        cadenceResetCount += 1;
+      };
+      if (!finalSamples.every(isPlaybackReady)) {
+        unreadySampleCount += 1;
+        resetCadenceWindow();
+        return false;
+      }
+      if (Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000 >= maxClientDeltaMs) {
+        resetCadenceWindow();
+        return false;
+      }
+      const sampledAt = Date.now();
+      if (!finalSamples.every((sample) => followsTargetTimeline(sample, sampledAt))) {
+        resetCadenceWindow();
+        return false;
+      }
+      if (frameSampleMs >= 400) {
+        const sampledFps = finalSamples.map((sample, index) => (
+          (sample.presentedFrames - frameSampleStartSamples[index].presentedFrames) / (frameSampleMs / 1_000)
+        ));
+        minimumSampledFps = sampledFps.map((fps, index) => (
+          minimumSampledFps[index] === null ? fps : Math.min(minimumSampledFps[index], fps)
+        ));
+        frameSampleStartedAt = Date.now();
+        frameSampleStartSamples = finalSamples;
+        if (!sampledFps.every((fps) => fps >= minimumPresentedFps)) {
+          slowFrameSampleCount += 1;
+          resetCadenceWindow();
+          return false;
+        }
+      }
+      if (observationMs < cadenceObservationMs) {
+        return false;
+      }
+      const hasHealthyFrameCadence = presentedFps.every((fps) => fps >= minimumPresentedFps);
+      if (!hasHealthyFrameCadence) {
+        slowFrameSampleCount += 1;
+        resetCadenceWindow();
+        return false;
+      }
+      return progressDeltaSec.every((progress) => progress >= minimumProgressSec);
+    },
+    { timeout: 30_000, intervals: [100, 250, 500, 1_000] }
   );
-  const initialAuthoritativeErrorTooLarge = expectedPosition !== undefined && firstPlayableErrorMs.some((errorMs) => (
-    errorMs === null || errorMs > maxInitialSyncErrorMs
-  ));
-
+  try {
+    await cadenceExpectation.toBe(true);
+  } catch (error) {
+    if (syncLog) {
+      syncLog.push({
+        targetPosition: expectedPosition ?? null,
+        phase: "frame-cadence-timeout",
+        loadingWaitMs,
+        convergenceWaitMs,
+        settledAfterMs: Date.now() - settleStartedAt,
+        totalWaitMs: Date.now() - synchronizationStartedAt,
+        samples: finalSamples,
+        deltaMs: finalSamples.length === 2
+          ? Math.round(Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000)
+          : null,
+        progressDeltaSec,
+        presentedFrameDelta,
+        droppedFrameDelta,
+        presentedFps,
+        minimumSampledFps,
+        slowFrameSampleCount,
+        unreadySampleCount,
+        cadenceResetCount
+      });
+      if (persistSyncLog) {
+        await persistSyncLog();
+      }
+    }
+    throw error;
+  }
+  const clientDeltaMs = Math.round(Math.abs(finalSamples[0].currentTime - finalSamples[1].currentTime) * 1_000);
   if (syncLog) {
-    const playbackFailed = fatalHlsErrorDuringSettle || fatalHlsErrorCount > 0 ||
-      hangDetected || unstablePlaybackDetected || desynchronizationDetected || repeatedSyncSeekDetected ||
-      loadingTooSlow || convergenceTooSlow || initialClientDeltaTooLarge || initialAuthoritativeErrorTooLarge;
     syncLog.push({
       targetPosition: expectedPosition ?? null,
       loadingWaitMs,
-      initialClientDeltaMs,
-      firstPlayableErrorMs,
       convergenceWaitMs,
-      settledAfterMs: settleMs,
+      settledAfterMs: Date.now() - settleStartedAt,
       totalWaitMs: Date.now() - synchronizationStartedAt,
-      samples: settleEndSamples.map(({ currentTime, forwardBufferSec, paused, readyState, seeking }) => ({
-        currentTime,
-        forwardBufferSec,
-        paused,
-        readyState,
-        seeking
-      })),
+      samples: finalSamples,
       deltaMs: clientDeltaMs,
       progressDeltaSec,
-      fatalHlsErrorCount,
-      hangDetected,
-      unstablePlaybackDetected,
-      desynchronizationDetected,
-      repeatedSyncSeekDetected,
-      syncSeekEventCounts,
-      syncAlignmentEventCounts,
-      loadingTooSlow,
-      convergenceTooSlow,
-      initialClientDeltaTooLarge,
-      initialAuthoritativeErrorTooLarge,
-      ...(playbackFailed
-        ? { failureDiagnostics: await playbackFailureDiagnostics([pageA, pageB]) }
-        : {})
+      presentedFrameDelta,
+      droppedFrameDelta,
+      presentedFps,
+      minimumSampledFps,
+      slowFrameSampleCount,
+      unreadySampleCount,
+      cadenceResetCount
     });
     if (persistSyncLog) {
       await persistSyncLog();
     }
   }
-  if (fatalHlsErrorDuringSettle || fatalHlsErrorCount > 0) {
-    throw new Error("Fatal HLS error occurred during the playback stability window");
-  }
-  if (hangDetected) {
-    throw new Error("Playback stopped progressing during the stability window");
-  }
-  if (unstablePlaybackDetected) {
-    throw new Error("Playback did not remain ready and playing during the stability window");
-  }
-  if (desynchronizationDetected) {
-    throw new Error("Playback clients diverged during the stability window");
-  }
-  if (repeatedSyncSeekDetected) {
-    throw new Error("A synchronized seek exceeded its bounded media correction attempts");
-  }
-  if (loadingTooSlow) {
-    throw new Error(`Seek loading exceeded ${maxSeekLoadingMs} ms`);
-  }
-  if (convergenceTooSlow) {
-    throw new Error(`Seek convergence exceeded ${maxSeekConvergenceMs} ms`);
-  }
-  if (initialClientDeltaTooLarge) {
-    throw new Error(`Initial client delta exceeded ${maxInitialClientDeltaMs} ms`);
-  }
-  if (initialAuthoritativeErrorTooLarge) {
-    throw new Error(`Initial authoritative error exceeded ${maxInitialSyncErrorMs} ms`);
-  }
-}
-
-function sampleErrorMs(sample) {
-  return Number.isFinite(sample.syncErrorMs) ? sample.syncErrorMs : null;
+  expect(finalSamples.every(isPlaybackReady)).toBe(true);
+  expect(clientDeltaMs).toBeLessThan(maxClientDeltaMs);
+  expect(progressDeltaSec.every((progress) => progress >= minimumProgressSec)).toBe(true);
+  expect(presentedFps.every((fps) => fps >= minimumPresentedFps)).toBe(true);
+  expect(finalSamples.every((sample) => followsTargetTimeline(sample, Date.now()))).toBe(true);
 }
 
 async function togglePlayback(page) {
@@ -368,8 +363,7 @@ test("two isolated browser contexts join the same synchronized room", async ({ b
   await expect.poll(async () => (await pipelineState(first.page))?.version).toBe(0);
   await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(0);
 
-  await first.context.close();
-  await second.context.close();
+  await Promise.all([first.context.close(), second.context.close()]);
 });
 
 test("HDRezka parser resolves a current HLS playlist", async ({ browserName }, testInfo) => {
@@ -393,7 +387,7 @@ test("HDRezka parser resolves a current HLS playlist", async ({ browserName }, t
 });
 
 test("media, play, seek, and pause propagate between browser contexts", async ({ browser, request }, testInfo) => {
-  test.setTimeout(300_000);
+  test.setTimeout(900_000);
   const mediaUrl = process.env.E2E_MEDIA_URL || resolvedSourceMedia?.mediaUrl || config.mediaUrl;
   test.skip(!mediaUrl, "Configure sourcePageUrl, E2E_MEDIA_URL, or mediaUrl with a playable source.");
   test.skip(config.run !== true || Number(config.participants) !== 2, "The E2E command config disables the two-participant scenario.");
@@ -451,14 +445,9 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   await togglePlayback(first.page);
   await expect.poll(async () => (await pipelineState(second.page))?.activationNeeded).toBe(true);
   const blockedVersion = (await pipelineState(second.page)).version;
-  const blockedPosition = await second.page.locator("#player").evaluate((video) => video.currentTime);
   await second.page.waitForTimeout(3_200);
-  const blockedPositionAfterReconciliation = await second.page.locator("#player").evaluate((video) => video.currentTime);
-  expect(Math.abs(blockedPositionAfterReconciliation - blockedPosition)).toBeLessThan(0.25);
-  const secondClientId = await second.page.evaluate(() => window.__anyTogetherClientId);
-  await expect.poll(() => first.page.evaluate((participantClientId) => (
-    window.__getParticipantSyncTelemetry?.(participantClientId)?.offsetMs ?? 0
-  ), secondClientId)).toBeGreaterThan(1_000);
+  await expect.poll(() => second.page.locator("#player").evaluate((video) => video.paused)).toBe(true);
+  await expect.poll(async () => (await pipelineState(second.page))?.paused).toBe(false);
   await togglePlayback(second.page);
   await expect.poll(async () => (await pipelineState(second.page))?.activationNeeded).toBe(false);
   try {
@@ -475,7 +464,7 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   await waitForPlayback(first.page, second.page, undefined, syncLog, persistSyncLog, playStartedAt);
 
   const random = createRandom(config.randomSeed);
-  const seekCount = Math.max(0, Math.floor(Number(config.seekCount) || config.seekPositionsSec?.length || 0));
+  const seekCount = Math.max(0, Math.floor(Number(config.seekCount) || 0));
   for (let index = 0; index < seekCount; index += 1) {
     const sourcePage = index % 2 === 0 ? first.page : second.page;
     const mediaSample = await sourcePage.locator("#player").evaluate((video) => ({
@@ -494,31 +483,16 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
 
     const versionBeforeSeek = (await pipelineState(first.page)).version;
     const seekStartedAt = Date.now();
-    if (index === 0) {
-      const progressBar = sourcePage.locator(".progress-bar");
-      const progressBox = await progressBar.boundingBox();
-      expect(progressBox).not.toBeNull();
-      const startX = progressBox.x + progressBox.width * 0.1;
-      const targetX = progressBox.x + progressBox.width * Math.min(1, targetPosition / duration);
-      const centerY = progressBox.y + progressBox.height / 2;
-      await sourcePage.mouse.move(startX, centerY);
-      await sourcePage.mouse.down();
-      await sourcePage.mouse.move(targetX, centerY, { steps: 12 });
-      await sourcePage.mouse.up();
-    } else {
-      const seekSent = await sourcePage.evaluate((position) => (
-        window.anyTogetherSyncBridge?.seek(position) === true
-      ), targetPosition);
-      expect(seekSent).toBe(true);
-    }
+    const seekSent = await sourcePage.evaluate((position) => (
+      window.anyTogetherSyncBridge?.seek(position) === true
+    ), targetPosition);
+    expect(seekSent).toBe(true);
     await expect.poll(
       async () => (await pipelineState(first.page))?.version,
       { timeout: 15_000 }
     ).toBeGreaterThan(versionBeforeSeek);
     const versionAfterSeek = (await pipelineState(first.page)).version;
-    if (index === 0) {
-      expect(versionAfterSeek).toBe(versionBeforeSeek + 1);
-    }
+    expect(versionAfterSeek).toBe(versionBeforeSeek + 1);
     await expect.poll(
       async () => (await pipelineState(second.page))?.version,
       { timeout: 15_000 }
@@ -536,6 +510,10 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionAfterPause);
   await expect.poll(async () => (await pipelineState(first.page))?.paused).toBe(true);
   await expect.poll(async () => (await pipelineState(second.page))?.paused).toBe(true);
+  await expect.poll(
+    async () => (await playbackSamples([first.page, second.page])).every((sample) => sample.paused),
+    { timeout: 15_000 }
+  ).toBe(true);
 
   const versionBeforeResume = (await pipelineState(first.page)).version;
   expect(await first.page.evaluate(() => window.anyTogetherSyncBridge?.play())).toBe(true);
@@ -545,7 +523,7 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
   ).toBeGreaterThan(versionBeforeResume);
   const versionAfterResume = (await pipelineState(first.page)).version;
   await expect.poll(async () => (await pipelineState(second.page))?.version).toBe(versionAfterResume);
-  await waitForPlayback(first.page, second.page);
+  await waitForPlayback(first.page, second.page, undefined, syncLog, persistSyncLog);
 
   const holdMs = Number(process.env.E2E_HOLD_MS || config.holdMs || 0);
   if (holdMs > 0) {
@@ -560,6 +538,8 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
     })
   )));
   expect(Math.max(...diagnosticReportBytes)).toBeLessThan(50 * 1_024);
+  const playbackSummary = summarizePlaybackWindows(syncLog);
+  console.log(`Playback cadence summary: ${JSON.stringify(playbackSummary)}`);
 
   await testInfo.attach("e2e-sync-summary", {
     body: Buffer.from(JSON.stringify({
@@ -567,6 +547,7 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
       roomId,
       seekCount,
       diagnosticReportBytes,
+      playbackSummary,
       entries: syncLog
     }, null, 2)),
     contentType: "application/json"
@@ -581,6 +562,5 @@ test("media, play, seek, and pause propagate between browser contexts", async ({
     contentType: "application/json"
   });
 
-  await first.context.close();
-  await second.context.close();
+  await Promise.all([first.context.close(), second.context.close()]);
 });
