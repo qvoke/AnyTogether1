@@ -31,6 +31,8 @@ const state = {
   hls: null,
   hlsBuffering: false,
   lastHlsRecoveryAt: 0,
+  hlsNetworkRecoveryAttempts: 0,
+  hlsNetworkRecoveryTimer: null,
   lastSyncErrorMs: 0,
   lastTelemetryAt: 0,
   lastTelemetrySignature: null,
@@ -490,6 +492,10 @@ function requestAuthoritativePlayback(player) {
 
 function unloadSource() {
   const player = elements.player;
+  if (state.hlsNetworkRecoveryTimer !== null) {
+    window.clearTimeout(state.hlsNetworkRecoveryTimer);
+    state.hlsNetworkRecoveryTimer = null;
+  }
   if (state.resetRateTimer !== null) {
     window.clearTimeout(state.resetRateTimer);
     state.resetRateTimer = null;
@@ -516,11 +522,16 @@ function loadSource(media) {
     return;
   }
 
+  const previousSourceId = state.sourceId;
   unloadSource();
   if (!media) {
+    state.hlsNetworkRecoveryAttempts = 0;
     return;
   }
 
+  if (previousSourceId !== media.id) {
+    state.hlsNetworkRecoveryAttempts = 0;
+  }
   state.sourceId = media.id;
   setPlaybackBlocked(false);
   if (elements.mediaUrl) {
@@ -580,6 +591,7 @@ function handleHlsFragmentLoaded(hls, data) {
   if (hls !== state.hls) {
     return;
   }
+  state.hlsNetworkRecoveryAttempts = 0;
   const stats = data.stats || data.frag?.stats;
   const loading = stats?.loading;
   const loadMs = Number.isFinite(loading?.end) && Number.isFinite(loading?.start)
@@ -636,6 +648,16 @@ function handleHlsError(hls, data) {
     logSyncEvent("HLS is correcting a buffer gap after the seek.");
     return;
   }
+  if (
+    !data.fatal &&
+    data.type === Hls.ErrorTypes.NETWORK_ERROR &&
+    ["fragLoadError", "fragLoadTimeOut"].includes(data.details) &&
+    (data.response?.code ?? 0) >= 400 &&
+    (data.errorAction?.retryCount ?? data.stats?.retry ?? 0) >= 1
+  ) {
+    scheduleHlsNetworkRecovery(hls);
+    return;
+  }
   if (!data.fatal) {
     return;
   }
@@ -661,6 +683,33 @@ function handleHlsError(hls, data) {
     return;
   }
   logSyncEvent("HLS playback error", data.details || "Unknown HLS error");
+}
+
+function scheduleHlsNetworkRecovery(hls) {
+  const media = state.roomState?.media;
+  if (
+    hls !== state.hls ||
+    !media ||
+    media.kind !== "hls" ||
+    state.hlsNetworkRecoveryAttempts >= 3 ||
+    state.hlsNetworkRecoveryTimer !== null
+  ) {
+    return;
+  }
+
+  state.hlsNetworkRecoveryAttempts += 1;
+  hls.stopLoad();
+  logSyncEvent("Restarting HLS after a segment request failure.", {
+    attempt: state.hlsNetworkRecoveryAttempts,
+    mediaId: media.id
+  });
+  state.hlsNetworkRecoveryTimer = window.setTimeout(() => {
+    state.hlsNetworkRecoveryTimer = null;
+    if (state.hls !== hls || state.roomState?.media?.id !== media.id) {
+      return;
+    }
+    loadSource(media);
+  }, 250);
 }
 
 function loadInterfaceMedia(url, forceReload = false) {
