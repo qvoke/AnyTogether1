@@ -483,7 +483,10 @@ function requestAuthoritativePlayback(player) {
     return;
   }
   state.remotePlayUntil = performance.now() + 10_000;
-  void player.play().catch(() => {
+  void player.play().catch((error) => {
+    if (error?.name === "AbortError") {
+      return;
+    }
     setPlaybackBlocked(true);
     state.remotePlayUntil = 0;
     logSyncEvent("Playback needs local activation", "Click the player once to allow audio playback.");
