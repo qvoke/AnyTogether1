@@ -418,6 +418,20 @@ function synchronizePlayer(reason) {
   if (!player || !roomState?.media || player.readyState < HTMLMediaElement.HAVE_METADATA) {
     return;
   }
+
+  if (roomState.media.kind === "hls" && !roomState.playback.paused) {
+    if (player.seeking || state.hlsBuffering) {
+      requestAuthoritativePlayback(player);
+      setPlaybackState();
+      return;
+    }
+    if (reason === "seeked") {
+      requestAuthoritativePlayback(player);
+      setPlaybackState();
+      return;
+    }
+  }
+
   const expectedPosition = clampPosition(getPositionAt(roomState, estimateServerNow()), player.duration);
   const error = expectedPosition - player.currentTime;
   const absoluteError = Math.abs(error);
